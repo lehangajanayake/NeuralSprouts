@@ -207,8 +207,7 @@ marimo/_lsp/
 __marimo__/
 
 # Project specific
-experiments/
-data/
 *.pth
 *.pt
-checkpoints/
+datasets/*
+!datasets/README.md
