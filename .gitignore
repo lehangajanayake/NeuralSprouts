@@ -209,5 +209,3 @@ __marimo__/
 # Project specific
 *.pth
 *.pt
-datasets/*
-!datasets/README.md
