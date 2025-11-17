@@ -71,8 +71,8 @@ class LettuceDataset(Dataset):
 
         # Load image paths and labels from CSV (example: Train.csv)
         # CSV columns: image_id,Height,Diameter,LeafArea,FreshWeightShoot,Variety,DryWeightShoot
-        # We use image_id (first col) + '.png' as filename, DryWeightShoot (last col) as label
-        # Example row: 15,5.1,16.1,87.6,3.2,Aphylion,0.16  -->  image: 15.png, label: 0.16
+        # We use image_id RGB_(first col) + '.png' as filename, DryWeightShoot (last col) as label
+        # Example row: 15,5.1,16.1,87.6,3.2,Aphylion,0.16  -->  image: RGB_15.png, label: 0.16
 
         self.image_paths = []
         self.labels = []
