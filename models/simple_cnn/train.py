@@ -181,6 +181,7 @@ if __name__ == "__main__":
     LEARNING_RATE = 0.001
     DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 
+
     print(f"Using device: {DEVICE}")
 
     # Create datasets
