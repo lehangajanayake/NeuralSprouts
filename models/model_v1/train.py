@@ -11,7 +11,7 @@ def train():
     # Config
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     batch_size = 32
-    epochs = 30
+    epochs = 50
     lr = 0.001
     image_size = 64
     # Dataset
@@ -41,9 +41,16 @@ def train():
     criterion_fusion = nn.MSELoss()
     criterion_cls = nn.CrossEntropyLoss()
     optimizer = optim.Adam(model.parameters(), lr=lr)
+    # Learning rate scheduler: Reduce LR if validation loss plateaus
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5)
 
 
     # Training loop
+    import matplotlib.pyplot as plt
+    train_losses = []
+    val_losses = []
+    val_maes = []
+    val_cls_accs = []
     best_val_mae = float('inf')
     for epoch in range(epochs):
         model.train()
@@ -58,11 +65,16 @@ def train():
             loss_cls = criterion_cls(cls_out, variety_class)
             loss_fusion = criterion_fusion(fusion_out.squeeze(), dry_weight)
             # Combine losses (weights can be tuned)
-            loss = loss_reg + 0.5 * loss_cls + 1.5 *loss_fusion
+            loss = loss_reg + 0.5 * loss_cls + 2 *loss_fusion
             loss.backward()
             optimizer.step()
             train_loss += loss.item() * images.size(0)
         train_loss /= len(train_loader.dataset)
+        train_losses.append(train_loss)
+
+        # Print current learning rate
+        current_lr = optimizer.param_groups[0]['lr']
+        print(f"Epoch {epoch+1}: Learning Rate = {current_lr:.6f}")
 
 
         # Validation
@@ -82,7 +94,7 @@ def train():
                 loss_reg = criterion_reg(reg_out.squeeze(), dry_weight)
                 loss_cls = criterion_cls(cls_out, variety_class)
                 loss_fusion = criterion_fusion(fusion_out.squeeze(), dry_weight)
-                loss = loss_reg + 0.5 * loss_cls + 1.5 *loss_fusion
+                loss = loss_reg + 0.5 * loss_cls + 2 *loss_fusion
 
 
                 val_loss += loss.item() * images.size(0)
@@ -98,6 +110,13 @@ def train():
         val_cls_acc /= n_val
         print(f"Epoch {epoch+1}/{epochs} | Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | Val MAE: {val_mae:.4f} | Val Cls Acc: {val_cls_acc:.4f}")
 
+        # Save metrics for plotting
+        val_losses.append(val_loss)
+        val_maes.append(val_mae)
+        val_cls_accs.append(val_cls_acc)
+
+        # Step the scheduler on validation loss
+        scheduler.step(val_loss)
 
         # Save best model by val MAE
         if val_mae < best_val_mae:
@@ -105,6 +124,31 @@ def train():
             torch.save(model.state_dict(), "best_model.pth")
             print(f"  -> Saved new best model (Val MAE: {val_mae:.4f})")
     print("Training complete.")
+
+    # Plot training summary
+    epochs_range = range(1, epochs+1)
+    plt.figure(figsize=(12, 4))
+    plt.subplot(1, 3, 1)
+    plt.plot(epochs_range, train_losses, label='Train Loss')
+    plt.plot(epochs_range, val_losses, label='Val Loss')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.title('Loss')
+    plt.legend()
+    plt.subplot(1, 3, 2)
+    plt.plot(epochs_range, val_maes, label='Val MAE', color='orange')
+    plt.xlabel('Epoch')
+    plt.ylabel('MAE')
+    plt.title('Validation MAE')
+    plt.legend()
+    plt.subplot(1, 3, 3)
+    plt.plot(epochs_range, val_cls_accs, label='Val Cls Acc', color='green')
+    plt.xlabel('Epoch')
+    plt.ylabel('Accuracy')
+    plt.title('Validation Classification Accuracy')
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
 
 if __name__ == "__main__":
     print("Model v1 architecture:")

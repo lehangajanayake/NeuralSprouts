@@ -18,6 +18,7 @@ os.makedirs(AUG_DEPTH, exist_ok=True)
 
 # Augmentation transforms
 flip = T.RandomHorizontalFlip(p=1.0)
+brightness = T.ColorJitter(brightness=0.5)
 rotate = T.RandomRotation(30)
 resize = T.Resize((64, 64))
 
@@ -60,6 +61,7 @@ for idx, row in df.iterrows():
     depth.save(os.path.join(AUG_DEPTH, f'Depth_{new_id}.png'))
     aug_rows.append({**row, 'id': new_id})
     next_id += 1
+
     # Augment: flip
     rgb_flip = flip(rgb)
     depth_flip = flip(depth)
@@ -68,12 +70,22 @@ for idx, row in df.iterrows():
     depth_flip.save(os.path.join(AUG_DEPTH, f'Depth_{new_id}.png'))
     aug_rows.append({**row, 'id': new_id})
     next_id += 1
+
     # Augment: rotate
     rgb_rot = rotate(rgb)
     depth_rot = rotate(depth)
     new_id = next_id
     rgb_rot.save(os.path.join(AUG_RGB, f'RGB_{new_id}.png'))
     depth_rot.save(os.path.join(AUG_DEPTH, f'Depth_{new_id}.png'))
+    aug_rows.append({**row, 'id': new_id})
+    next_id += 1
+
+    # Augment: brightness
+    rgb_bright = brightness(rgb)
+    depth_bright = brightness(depth)
+    new_id = next_id
+    rgb_bright.save(os.path.join(AUG_RGB, f'RGB_{new_id}.png'))
+    depth_bright.save(os.path.join(AUG_DEPTH, f'Depth_{new_id}.png'))
     aug_rows.append({**row, 'id': new_id})
     next_id += 1
 

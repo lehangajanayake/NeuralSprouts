@@ -3,18 +3,19 @@ import torch
 import matplotlib.pyplot as plt
 from model_v1.dataloader import LettuceDataset
 from model_v1.model import model_v1
+from model_v1.augmented_dataloader import AugmentedLettuceDataset
 
 # Config
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-TRAIN_RGB = '../datasets/Training/RGBImages'
-TRAIN_DEPTH = '../datasets/Training/DepthImages'
-TRAIN_CSV = '../datasets/Training/Train.csv'
+TRAIN_RGB = '../datasets/Training/Augmented/RGBImages'
+TRAIN_DEPTH = '../datasets/Training/Augmented/DepthImages'
+TRAIN_CSV = '../datasets/Training/Augmented/Train_aug.csv'
 MODEL_PATH = 'best_model.pth'
 IMAGE_SIZE = 64
 
 def evaluate_on_training():
     print('Loading training dataset...')
-    train_dataset = LettuceDataset(
+    train_dataset = AugmentedLettuceDataset(
         RGB_dir=TRAIN_RGB,
         depth_dir=TRAIN_DEPTH,
         labels_file=TRAIN_CSV,
