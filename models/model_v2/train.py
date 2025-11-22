@@ -12,14 +12,14 @@ TRAIN_CSV = '../../datasets/Training/Augmented/Train_aug.csv'
 RGB_DIR = '../../datasets/Training/Augmented/RGBImages/'
 DEPTH_DIR = '../../datasets/Training/Augmented/DepthImages/'
 BATCH_SIZE = 32
-EPOCHS = 150
+EPOCHS = 300
 LR = 1e-3
 
 
 
 # Dataset and DataLoader with validation split
 from torch.utils.data import random_split
-full_dataset = PlantDatasetV2(TRAIN_CSV, RGB_DIR, DEPTH_DIR)
+full_dataset = PlantDatasetV2(RGB_DIR, DEPTH_DIR, TRAIN_CSV)
 val_ratio = 0.2
 val_size = int(len(full_dataset) * val_ratio)
 train_size = len(full_dataset) - val_size
@@ -34,9 +34,17 @@ for i in range(len(full_dataset)):
     all_classes.add(int(y_class))
 print('Unique y_class indices in dataset:', all_classes)
 
+
 # Model, Loss, Optimizer
+import os
 model = ModelV2(num_classes=4)
 model = model.cuda() if torch.cuda.is_available() else model
+# Resume from best model if exists
+if os.path.exists('best_model_v2.pth'):
+    model.load_state_dict(torch.load('best_model_v2.pth', map_location='cuda' if torch.cuda.is_available() else 'cpu'))
+    print('Resumed training from existing best_model_v2.pth')
+else:
+    print('No existing best model found, starting fresh.')
 
 criterion_reg = nn.MSELoss()
 criterion_class = nn.CrossEntropyLoss()
