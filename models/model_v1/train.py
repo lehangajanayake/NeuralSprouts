@@ -11,7 +11,7 @@ def train():
     # Config
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     batch_size = 32
-    epochs = 50
+    epochs = 200
     lr = 0.001
     image_size = 64
     # Dataset
