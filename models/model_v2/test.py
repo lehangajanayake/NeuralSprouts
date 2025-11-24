@@ -30,11 +30,11 @@ all_image_ids = []
 abs_errors = []
 
 with torch.no_grad():
-    for x, y_reg, y_class, leaf_area in test_loader:
+    for x, dryweight, image_id in test_loader:
         x = x.cuda() if torch.cuda.is_available() else x
         _, _, _, fusion_out = model(x)
         preds = fusion_out.cpu().numpy().flatten()
-        targets = y_reg.cpu().numpy().flatten()
+        targets = dryweight.cpu().numpy().flatten()
         all_preds.extend(preds.tolist())
         all_targets.extend(targets.tolist())
         # Try to get image ids if available

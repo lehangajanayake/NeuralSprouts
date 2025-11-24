@@ -90,6 +90,7 @@ class TestPlantDatasetV2(Dataset):
         image_id = self.df.iloc[idx]['image_id']
         image_rgb = Image.open(rgb_path).convert('RGB')
         image_depth = Image.open(depth_path).convert('L')
+        dryweight = self.df.iloc[idx].get('DryWeightShoot')
         # crop to square from center to a size of 900x900
         width, height = image_rgb.size
         left = (width - 900) / 2
@@ -108,4 +109,4 @@ class TestPlantDatasetV2(Dataset):
             depth_np = depth_np[..., None]
         combined_np = np.concatenate([rgb_np, depth_np], axis=2)
         image = torch.from_numpy(combined_np).permute(2, 0, 1).float() / 255.0
-        return image, image_id
+        return image, dryweight,  image_id
