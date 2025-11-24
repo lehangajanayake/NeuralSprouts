@@ -47,6 +47,7 @@ else:
     print('No existing best model found, starting fresh.')
 
 criterion_reg = nn.MSELoss()
+criterion_fusion = nn.MSELoss()
 criterion_class = nn.CrossEntropyLoss()
 criterion_leaf = nn.MSELoss()
 optimizer = optim.Adam(model.parameters(), lr=LR)
@@ -70,13 +71,14 @@ for epoch in range(EPOCHS):
         reg_out, class_out, leaf_out, fusion_out = model(x)
         loss_reg = criterion_reg(reg_out.squeeze(), y_reg)
         loss_class = criterion_class(class_out, y_class)
+        loss_fusion = criterion_fusion(fusion_out.squeeze(), y_reg)
         loss_leaf = criterion_leaf(leaf_out.squeeze(), leaf_area) if leaf_area is not None else 0
-        loss = 2 * loss_reg + loss_class * 0.5 + loss_leaf * 0.4
+        loss = 0.8 * loss_reg + loss_class * 0.4 + loss_leaf * 0.4 + loss_fusion * 2
         loss.backward()
         optimizer.step()
         running_loss += loss.item() * x.size(0)
         # Track MAE for train
-        mae = torch.abs(reg_out.squeeze() - y_reg).sum().item()
+        mae = torch.abs(fusion_out.squeeze() - y_reg).sum().item()
         train_mae += mae
         n_train += y_reg.size(0)
     train_mae = train_mae / n_train if n_train > 0 else 0
@@ -90,8 +92,8 @@ for epoch in range(EPOCHS):
         for x, y_reg, y_class, leaf_area in val_loader:
             x = x.cuda() if torch.cuda.is_available() else x
             y_reg = y_reg.cuda() if torch.cuda.is_available() else y_reg
-            reg_out, _, _, _ = model(x)
-            mae = torch.abs(reg_out.squeeze() - y_reg).sum().item()
+            _, _, _, fusion_out = model(x)
+            mae = torch.abs(fusion_out.squeeze() - y_reg).sum().item()
             val_mae += mae
             n_val += y_reg.size(0)
     val_mae = val_mae / n_val if n_val > 0 else 0
