@@ -31,8 +31,8 @@ def predict_and_save():
     with torch.no_grad():
         for images, image_ids in test_loader:
             images = images.to(DEVICE)
-            reg_out, class_out, leaf_out, fusion_out = model(images)
-            preds = reg_out.cpu().numpy().flatten().tolist()
+            _, _, _, fusion_out = model(images)
+            preds = fusion_out.cpu().numpy().flatten().tolist()
             # image_ids is a batch
             if isinstance(image_ids, torch.Tensor):
                 image_ids = image_ids.cpu().numpy().tolist()
