@@ -29,7 +29,7 @@ def predict_and_save():
 
     predictions = {}
     with torch.no_grad():
-        for images, image_ids in test_loader:
+        for images, _ , image_ids in test_loader:
             images = images.to(DEVICE)
             _, _, _, fusion_out = model(images)
             preds = fusion_out.cpu().numpy().flatten().tolist()

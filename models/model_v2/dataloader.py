@@ -76,6 +76,7 @@ class TestPlantDatasetV2(Dataset):
         self.image_size = image_size
         for index, row in self.df.iterrows():
             id = row['image_id'] if 'image_id' in self.df.columns else row['id']
+            id = int(id)
             rgb_path = os.path.join(self.RGB_dir, f"RGB_{id}.png")
             depth_path = os.path.join(self.depth_dir, f"Depth_{id}.png")
             self.df.at[index, 'rgb_path'] = rgb_path
