@@ -11,7 +11,7 @@ import matplotlib.pyplot as plt
 TRAIN_CSV = '../../datasets/Training/Augmented/Train_aug.csv'
 RGB_DIR = '../../datasets/Training/Augmented/RGBImages/'
 DEPTH_DIR = '../../datasets/Training/Augmented/DepthImages/'
-BATCH_SIZE = 128
+BATCH_SIZE = 32
 EPOCHS = 100
 LR = 1e-3
 
@@ -96,9 +96,9 @@ for epoch in range(EPOCHS):
         reg_out, class_out, leaf_out, fusion_out = model(x)
         loss_reg = criterion_reg(reg_out.squeeze(), y_reg)
         loss_class = criterion_class(class_out, y_class)
-        loss_fusion = criterion_fusion(fusion_out.squeeze(), y_reg)
+        loss_fusion = torch.sqrt(criterion_fusion(fusion_out.squeeze(), y_reg))
         loss_leaf = criterion_leaf(leaf_out.squeeze(), leaf_area) if leaf_area is not None else 0
-        loss = 0 * loss_reg + loss_class * 0.4 + loss_leaf * 0.4 + loss_fusion * 2
+        loss = 0.5 * loss_reg + loss_class * 0.4 + loss_leaf * 0.4 + loss_fusion * 2
         loss.backward()
         optimizer.step()
         running_loss += loss.item() * x.size(0)
