@@ -74,9 +74,14 @@ class TestPlantDatasetV2(Dataset):
         self.depth_dir = depth_dir
         self.df = pd.read_csv(csv_file)
         self.image_size = image_size
-        # Precompute paths
-        self.df['rgb_path'] = self.df['image_id'].apply(lambda x: os.path.join(self.RGB_dir, f"RGB_{x}.png"))
-        self.df['depth_path'] = self.df['image_id'].apply(lambda x: os.path.join(self.depth_dir, f"Depth_{x}.png"))
+        for index, row in self.df.iterrows():
+            id = row['image_id'] if 'image_id' in self.df.columns else row['id']
+            rgb_path = os.path.join(self.RGB_dir, f"RGB_{id}.png")
+            depth_path = os.path.join(self.depth_dir, f"Depth_{id}.png")
+            if not os.path.exists(rgb_path) or not os.path.exists(depth_path):
+                print(f"Image not found: RGB: {rgb_path}, Depth: {depth_path}")
+                self.df.drop(index, inplace=True)
+                continue
 
     def __len__(self):
         return len(self.df)
