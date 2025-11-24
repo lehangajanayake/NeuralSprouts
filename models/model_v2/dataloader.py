@@ -78,6 +78,8 @@ class TestPlantDatasetV2(Dataset):
             id = row['image_id'] if 'image_id' in self.df.columns else row['id']
             rgb_path = os.path.join(self.RGB_dir, f"RGB_{id}.png")
             depth_path = os.path.join(self.depth_dir, f"Depth_{id}.png")
+            self.df.at[index, 'rgb_path'] = rgb_path
+            self.df.at[index, 'depth_path'] = depth_path
             if not os.path.exists(rgb_path) or not os.path.exists(depth_path):
                 print(f"Image not found: RGB: {rgb_path}, Depth: {depth_path}")
                 self.df.drop(index, inplace=True)
