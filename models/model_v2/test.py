@@ -1,7 +1,7 @@
 import torch
 from torch.utils.data import DataLoader
 from model import ModelV2
-from dataloader import PlantDatasetV2
+from dataloader import TestPlantDatasetV2
 
 # Example paths (update as needed)
 
@@ -12,7 +12,7 @@ DEPTH_DIR = '../../datasets/Training/DepthImages/'
 BATCH_SIZE = 16
 
 # Dataset and DataLoader
-test_dataset = PlantDatasetV2(RGB_DIR, DEPTH_DIR, TEST_CSV)
+test_dataset = TestPlantDatasetV2(RGB_DIR, DEPTH_DIR, TEST_CSV)
 test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False)
 
 # Load model

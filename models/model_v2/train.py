@@ -11,7 +11,7 @@ import matplotlib.pyplot as plt
 TRAIN_CSV = '../../datasets/Training/Augmented/Train_aug.csv'
 RGB_DIR = '../../datasets/Training/Augmented/RGBImages/'
 DEPTH_DIR = '../../datasets/Training/Augmented/DepthImages/'
-BATCH_SIZE = 32
+BATCH_SIZE = 64
 EPOCHS = 300
 LR = 1e-3
 
@@ -46,11 +46,24 @@ if os.path.exists('best_model_v2.pth'):
 else:
     print('No existing best model found, starting fresh.')
 
+
 criterion_reg = nn.MSELoss()
 criterion_fusion = nn.MSELoss()
 criterion_class = nn.CrossEntropyLoss()
 criterion_leaf = nn.MSELoss()
-optimizer = optim.Adam(model.parameters(), lr=LR)
+
+# Choose optimizer: AdamW (recommended) or Adam
+use_adamw = True
+if use_adamw:
+    optimizer = optim.AdamW(model.parameters(), lr=LR, weight_decay=1e-2)
+    print('Using AdamW optimizer')
+else:
+    optimizer = optim.Adam(model.parameters(), lr=LR)
+    print('Using Adam optimizer')
+
+# Learning rate scheduler: ReduceLROnPlateau
+from torch.optim.lr_scheduler import ReduceLROnPlateau
+scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=10, min_lr=1e-6)
 
 best_val_mae = float('inf')
 save_after = 20  # Save best model after this many epochs
@@ -98,7 +111,13 @@ for epoch in range(EPOCHS):
             n_val += y_reg.size(0)
     val_mae = val_mae / n_val if n_val > 0 else 0
     val_maes.append(val_mae)
-    print(f"Epoch {epoch+1}/{EPOCHS} Train MAE: {train_mae:.4f} | Val MAE: {val_mae:.4f}, Train Loss: {running_loss/len(train_loader.dataset):.4f}  ")
+
+    # Print current learning rate
+    current_lr = optimizer.param_groups[0]['lr']
+    print(f"Epoch {epoch+1}/{EPOCHS} | LR: {current_lr:.6f} | Train MAE: {train_mae:.4f} | Val MAE: {val_mae:.4f}, Train Loss: {running_loss/len(train_loader.dataset):.4f}")
+
+    # Step the scheduler with validation MAE
+    scheduler.step(val_mae)
 
 
     # Save best model after a few epochs based on validation MAE

@@ -7,18 +7,11 @@ import torch
 import numpy as np
 
 class PlantDatasetV2(Dataset):
-    def __init__(self, RGB_dir, depth_dir, labels_file, image_size=64, augment=False):
+    def __init__(self, RGB_dir, depth_dir, labels_file, image_size=64):
         self.RGB_dir = RGB_dir
         self.depth_dir = depth_dir
         self.labels_file = labels_file
         self.image_size = image_size
-        self.augment = augment
-        import torchvision.transforms as T
-        self.aug_transform = T.Compose([
-            T.RandomHorizontalFlip(),
-            T.RandomVerticalFlip(),
-            T.RandomRotation(30),
-        ]) if augment else None
 
         self.df = pd.read_csv(labels_file)
         if 'image_id' in self.df.columns:
@@ -45,23 +38,9 @@ class PlantDatasetV2(Dataset):
     def __getitem__(self, idx):
         rgb_path = self.df.iloc[idx]['rgb_path']
         depth_path = self.df.iloc[idx]['depth_path']
-        image_id = self.df.iloc[idx]['id']
 
         image_rgb = Image.open(rgb_path).convert('RGB')
         image_depth = Image.open(depth_path).convert('L')
-
-        # crop to square from center to a size of 900x900
-        width, height = image_rgb.size
-        left = (width - 900) / 2
-        top = (height - 900) / 2
-        right = (width + 900) / 2
-        bottom = (height + 900) / 2
-        image_rgb = image_rgb.crop((left, top, right, bottom))
-        image_depth = image_depth.crop((left, top, right, bottom))
-
-        # Resize images
-        image_rgb = image_rgb.resize((self.image_size, self.image_size))
-        image_depth = image_depth.resize((self.image_size, self.image_size))
 
         # Convert images to numpy arrays
         rgb_np = np.array(image_rgb)  # Shape: (H, W, 3)
@@ -70,24 +49,6 @@ class PlantDatasetV2(Dataset):
             depth_np = depth_np[..., None]  # Shape: (H, W, 1)
         combined_np = np.concatenate([rgb_np, depth_np], axis=2)  # Shape: (H, W, 4)
         image = torch.from_numpy(combined_np).permute(2, 0, 1).float() / 255.0  # Shape: (4, H, W)
-
-        # Data augmentation (random flips and rotations) for training only
-        if self.augment:
-            import torchvision.transforms.functional as TF
-            import random
-            image_rgb = TF.to_pil_image(image[:3])
-            image_depth = TF.to_pil_image(image[3].unsqueeze(0))
-            seed = np.random.randint(2147483647)
-            torch.manual_seed(seed)
-            random.seed(seed)
-            image_rgb = self.aug_transform(image_rgb)
-            torch.manual_seed(seed)
-            random.seed(seed)
-            image_depth = self.aug_transform(image_depth)
-            rgb_np = np.array(image_rgb)
-            depth_np = np.array(image_depth)[..., None]
-            combined_np = np.concatenate([rgb_np, depth_np], axis=2)
-            image = torch.from_numpy(combined_np).permute(2, 0, 1).float() / 255.0
 
         dry_weight = float(self.df.iloc[idx]['DryWeightShoot'])
         variety_class = int(self.df.iloc[idx]['VarietyClass'])
