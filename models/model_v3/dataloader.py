@@ -35,12 +35,19 @@ class SimplePlantDataset(Dataset):
         self.df = pd.DataFrame(keep_rows).reset_index(drop=True)
 
         # Optional CPU-RAM cache to avoid repeating expensive PIL decode/resize
-        # and normalization on every epoch. This is usually the best "easy"
-        # speed-up before attempting anything GPU-memory related.
+        # and normalization on every epoch.
+        #
+        # Two modes:
+        # 1) enable_cache=True, num_views=1: cache the single preprocessed tensor per item.
+        # 2) enable_cache=True, num_views>1: cache K random augmentations ("views") per item.
         #
         # NOTE: Default is off to avoid large RAM usage.
         self.enable_cache = False
-        self._cache = {}  # type: Dict[int, torch.Tensor]
+        # Option B: when num_views > 1, the dataset length becomes N * num_views.
+        # Each (base_idx, view_idx) is treated as a separate sample.
+        self.num_views = 1
+        self.cache_seed = 42
+        self._cache = {}  # type: Dict[object, torch.Tensor]
 
         if transforms is None:
             # Fallback if torchvision isn't importable.
@@ -48,23 +55,48 @@ class SimplePlantDataset(Dataset):
             self._mean = torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32).view(3, 1, 1)
             self._std = torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32).view(3, 1, 1)
             self.transform = None
+            self.aug_transform = None
         else:
+            # Base preprocessing for ResNet
             self.transform = transforms.Compose([
                 transforms.Resize((self.image_size, self.image_size)),
                 transforms.ToTensor(),
                 transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
             ])
 
+            # Random augmentations (applied before resize/ToTensor/Normalize)
+            # These are used only when building multi-view caches.
+            self.aug_transform = transforms.Compose([
+                transforms.RandomResizedCrop(self.image_size, scale=(0.75, 1.0), ratio=(0.9, 1.1)),
+                transforms.RandomHorizontalFlip(p=0.5),
+                transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.02),
+            ])
+
     def __len__(self):
-        return len(self.df)
+        base_len = len(self.df)
+        if self.num_views and self.num_views > 1:
+            return base_len * int(self.num_views)
+        return base_len
+
+    def _map_index(self, global_idx: int):
+        """Map a global sample index into (base_idx, view_idx)."""
+        base_len = len(self.df)
+        if self.num_views and self.num_views > 1:
+            base_idx = global_idx % base_len
+            view_idx = global_idx // base_len
+            return int(base_idx), int(view_idx)
+        return int(global_idx), 0
 
     def __getitem__(self, idx):
-        if self.enable_cache and idx in self._cache:
-            rgb = self._cache[idx]
-            dry_weight = float(self.df.iloc[idx]['DryWeightShoot'])
-            return rgb, torch.tensor(dry_weight, dtype=torch.float32)
+        base_idx, view_idx = self._map_index(idx)
+        if self.enable_cache:
+            key = (base_idx, view_idx)
+            if key in self._cache:
+                rgb = self._cache[key]
+                dry_weight = float(self.df.iloc[base_idx]['DryWeightShoot'])
+                return rgb, torch.tensor(dry_weight, dtype=torch.float32)
 
-        rgb_path = self.df.iloc[idx]['rgb_path']
+        rgb_path = self.df.iloc[base_idx]['rgb_path']
 
         rgb_img = Image.open(rgb_path).convert('RGB')
         if self.transform is not None:
@@ -75,12 +107,12 @@ class SimplePlantDataset(Dataset):
             rgb = torch.from_numpy(rgb_np).permute(2, 0, 1).contiguous()  # (C, H, W)
             rgb = (rgb - self._mean) / self._std
 
-        dry_weight = float(self.df.iloc[idx]['DryWeightShoot'])
+        dry_weight = float(self.df.iloc[base_idx]['DryWeightShoot'])
         dry_weight = torch.tensor(dry_weight, dtype=torch.float32)
 
         if self.enable_cache:
             # Keep tensors on CPU; DataLoader can pin memory and transfer async.
-            self._cache[idx] = rgb
+            self._cache[(base_idx, view_idx)] = rgb
         return rgb, dry_weight
 
     def build_cache(self, max_items: Optional[int] = None):
@@ -91,6 +123,39 @@ class SimplePlantDataset(Dataset):
         fits for real datasets and prevents multi-worker loading.
         """
         self.enable_cache = True
-        n = len(self) if max_items is None else min(len(self), max_items)
+
+        # Cache always builds from the *base* dataset (before view expansion).
+        base_len = len(self.df)
+        n = base_len if max_items is None else min(base_len, max_items)
+
+        # Deterministic cache generation
+        torch.manual_seed(self.cache_seed)
+
         for i in range(n):
-            _ = self[i]
+            if self.num_views <= 1:
+                # Populate (i,0)
+                _ = self._build_one(i, view_idx=0)
+            else:
+                for v in range(self.num_views):
+                    _ = self._build_one(i, view_idx=v)
+
+    def _build_one(self, idx: int, view_idx: int = 0):
+        """Build one cached view deterministically."""
+        rgb_path = self.df.iloc[idx]['rgb_path']
+        rgb_img = Image.open(rgb_path).convert('RGB')
+
+        if self.transform is None:
+            # Fallback path (no torchvision). No random augmentation here.
+            rgb_img = rgb_img.resize(self.image_size, resample=Image.BILINEAR)
+            rgb_np = np.asarray(rgb_img, dtype=np.float32) / 255.0
+            rgb = torch.from_numpy(rgb_np).permute(2, 0, 1).contiguous()
+            rgb = (rgb - self._mean) / self._std
+        else:
+            # For caching, apply deterministic random augmentation by reseeding per (idx, view_idx)
+            if self.num_views > 1:
+                torch.manual_seed(self.cache_seed + idx * 1000 + view_idx)
+                rgb_img = self.aug_transform(rgb_img)
+            rgb = self.transform(rgb_img)
+
+        self._cache[(idx, view_idx)] = rgb
+        return rgb

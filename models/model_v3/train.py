@@ -7,6 +7,43 @@ from dataloader import SimplePlantDataset
 import matplotlib.pyplot as plt
 import os
 import multiprocessing as mp
+import random
+import numpy as np
+
+
+def seed_everything(seed: int = 42, deterministic: bool = True):
+    """Seed Python/NumPy/PyTorch for (mostly) reproducible training.
+
+    Notes:
+    - Full determinism can reduce speed.
+    - Some CUDA ops can still be non-deterministic depending on hardware.
+    """
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    if deterministic:
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+        try:
+            torch.use_deterministic_algorithms(True)
+        except Exception:
+            pass
+
+
+def seed_worker(worker_id: int):
+    # Make each worker's RNG deterministic but different.
+    worker_seed = torch.initial_seed() % 2**32
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
+
+
+def estimate_cache_ram_gb(num_base_images: int, num_views: int, image_size: int = 224, dtype_bytes: int = 4) -> float:
+    """Rough RAM estimate for caching tensors: N * K * (3*H*W*dtype_bytes)."""
+    bytes_per = 3 * image_size * image_size * dtype_bytes
+    total_bytes = int(num_base_images) * int(num_views) * bytes_per
+    return total_bytes / (1024**3)
 
 def plot_and_save(train_maes, val_maes, train_losses, val_losses, out_path='summary_v3.png'):
     # Robust to early interrupt: plot only the available points.
@@ -45,6 +82,11 @@ def main():
     BATCH_SIZE = 32
     EPOCHS = 20
     LR = 1e-3
+    SEED = 42
+    NUM_VIEWS = 4  # number of cached random augmentations per image
+    CACHE_MAX_ITEMS = None  # set to an int to cache only a subset (safer on RAM)
+
+    seed_everything(SEED, deterministic=True)
 
     DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -56,20 +98,47 @@ def main():
     train_dataset, val_dataset = random_split(
         full_dataset,
         [train_size, val_size],
-        generator=torch.Generator().manual_seed(42)
+        generator=torch.Generator().manual_seed(SEED)
     )
 
-    # Build cache for faster loading if desired (CPU-RAM). This can be heavy.
-    # Leave off by default; enable if your RAM can handle it.
-    # full_dataset.enable_cache = True
-    # full_dataset.build_cache()
+    # Cache multiple random augmented "views" per image for faster epochs.
+    # This trades RAM for speed and helps reduce overfitting.
+    full_dataset.num_views = NUM_VIEWS
+    full_dataset.cache_seed = SEED
+    full_dataset.enable_cache = True
+    est_gb = estimate_cache_ram_gb(len(full_dataset.df), NUM_VIEWS, image_size=224, dtype_bytes=4)
+    print(f"[cache] Planning to cache {len(full_dataset.df)} images x {NUM_VIEWS} views (~{est_gb:.2f} GB RAM for float32 tensors).")
+    if est_gb >= 8.0 and CACHE_MAX_ITEMS is None:
+        print("[cache] WARNING: This may exceed your available RAM. Consider lowering NUM_VIEWS or setting CACHE_MAX_ITEMS.")
+
+    full_dataset.build_cache(max_items=CACHE_MAX_ITEMS)
 
     # On Windows you MUST guard entrypoint when using num_workers>0.
     # Keep 0 as a safe default; you can increase once everything works.
     num_workers = 0 if os.name == 'nt' else 2
     pin_memory = torch.cuda.is_available()
-    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=num_workers, pin_memory=pin_memory)
-    val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=num_workers, pin_memory=pin_memory)
+    # Generator makes shuffle order reproducible when combined with seeds.
+    g = torch.Generator()
+    g.manual_seed(SEED)
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=BATCH_SIZE,
+        shuffle=True,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        worker_init_fn=seed_worker,
+        generator=g,
+    )
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=BATCH_SIZE,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        worker_init_fn=seed_worker,
+        generator=g,
+    )
 
     # Model, Loss, Optimizer (regression only)
     model = SimpleResNetModel().to(DEVICE)
