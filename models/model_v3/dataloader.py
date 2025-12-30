@@ -12,10 +12,11 @@ except Exception:
     import numpy as np
 
 class SimplePlantDataset(Dataset):
-    def __init__(self, RGB_dir, labels_file, image_size=224):
+    def __init__(self, RGB_dir, labels_file, image_size=224, return_debug: bool = False):
         self.RGB_dir = RGB_dir
         self.labels_file = labels_file
         self.image_size = image_size
+        self.return_debug = bool(return_debug)
         self.df = pd.read_csv(labels_file)
         if 'image_id' in self.df.columns:
             self.df.rename(columns={'image_id': 'id'}, inplace=True)
@@ -67,8 +68,9 @@ class SimplePlantDataset(Dataset):
             # Random augmentations (applied before resize/ToTensor/Normalize)
             # These are used only when building multi-view caches.
             self.aug_transform = transforms.Compose([
-                transforms.RandomResizedCrop(self.image_size, scale=(0.75, 1.0), ratio=(0.9, 1.1)),
+                transforms.CenterCrop(900),
                 transforms.RandomHorizontalFlip(p=0.5),
+                transforms.RandomRotation(90),
                 transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.02),
             ])
 
@@ -94,18 +96,61 @@ class SimplePlantDataset(Dataset):
             if key in self._cache:
                 rgb = self._cache[key]
                 dry_weight = float(self.df.iloc[base_idx]['DryWeightShoot'])
-                return rgb, torch.tensor(dry_weight, dtype=torch.float32)
+                y = torch.tensor(dry_weight, dtype=torch.float32)
+                if self.return_debug:
+                    meta = {
+                        'global_idx': int(idx),
+                        'base_idx': int(base_idx),
+                        'view_idx': int(view_idx),
+                        'id': int(self.df.iloc[base_idx]['id']),
+                        'rgb_path': str(self.df.iloc[base_idx]['rgb_path']),
+                        'cached': True,
+                    }
+                    # When serving from cache, we can still provide an unaugmented/original view
+                    # by re-loading the image (debug only).
+                    rgb_img = Image.open(meta['rgb_path']).convert('RGB')
+                    if self.transform is not None:
+                        rgb_orig = self.transform(rgb_img)
+                    else:
+                        rgb_img = rgb_img.resize(self.image_size, resample=Image.BILINEAR)
+                        rgb_np = np.asarray(rgb_img, dtype=np.float32) / 255.0
+                        rgb_orig = torch.from_numpy(rgb_np).permute(2, 0, 1).contiguous()
+                        rgb_orig = (rgb_orig - self._mean) / self._std
+                    return rgb, rgb_orig, y, meta
+                return rgb, y
 
         rgb_path = self.df.iloc[base_idx]['rgb_path']
 
         rgb_img = Image.open(rgb_path).convert('RGB')
-        if self.transform is not None:
-            rgb = self.transform(rgb_img)
+
+        # Deterministic augmentation for Option B (num_views > 1)
+        # This makes the debugger reflect what each (base_idx, view_idx) view actually is,
+        # even before you build the cache.
+        aug_applied = False
+        view_seed = None
+        if self.transform is not None and self.num_views and self.num_views > 1:
+            view_seed = int(self.cache_seed + base_idx * 1000 + view_idx)
+            torch.manual_seed(view_seed)
+            rgb_img_aug = self.aug_transform(rgb_img)
+            aug_applied = True
         else:
-            rgb_img = rgb_img.resize(self.image_size, resample=Image.BILINEAR)
-            rgb_np = np.asarray(rgb_img, dtype=np.float32) / 255.0  # (H, W, C)
-            rgb = torch.from_numpy(rgb_np).permute(2, 0, 1).contiguous()  # (C, H, W)
-            rgb = (rgb - self._mean) / self._std
+            rgb_img_aug = rgb_img
+
+        # Original (no random augmentation), used for debug views.
+        if self.transform is not None:
+            rgb_orig = self.transform(rgb_img)
+        else:
+            rgb_img_fallback = rgb_img.resize(self.image_size, resample=Image.BILINEAR)
+            rgb_np = np.asarray(rgb_img_fallback, dtype=np.float32) / 255.0  # (H, W, C)
+            rgb_orig = torch.from_numpy(rgb_np).permute(2, 0, 1).contiguous()  # (C, H, W)
+            rgb_orig = (rgb_orig - self._mean) / self._std
+
+        # The view returned for training/debug.
+        if self.transform is not None:
+            rgb = self.transform(rgb_img_aug)
+        else:
+            # Fallback: no torchvision => no random aug implemented here.
+            rgb = rgb_orig
 
         dry_weight = float(self.df.iloc[base_idx]['DryWeightShoot'])
         dry_weight = torch.tensor(dry_weight, dtype=torch.float32)
@@ -113,6 +158,20 @@ class SimplePlantDataset(Dataset):
         if self.enable_cache:
             # Keep tensors on CPU; DataLoader can pin memory and transfer async.
             self._cache[(base_idx, view_idx)] = rgb
+
+        if self.return_debug:
+            meta = {
+                'global_idx': int(idx),
+                'base_idx': int(base_idx),
+                'view_idx': int(view_idx),
+                'id': int(self.df.iloc[base_idx]['id']),
+                'rgb_path': str(rgb_path),
+                'cached': False,
+                'aug_applied': bool(aug_applied),
+                'view_seed': int(view_seed) if view_seed is not None else None,
+            }
+            return rgb, rgb_orig, dry_weight, meta
+
         return rgb, dry_weight
 
     def build_cache(self, max_items: Optional[int] = None):
