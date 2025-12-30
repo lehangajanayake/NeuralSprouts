@@ -3,6 +3,7 @@ import os
 from PIL import Image
 from torch.utils.data import Dataset
 import torch
+from typing import Optional, Dict
 
 try:
     from torchvision import transforms
@@ -39,6 +40,14 @@ class SimplePlantDataset(Dataset):
             keep_rows.append(row)
         self.df = pd.DataFrame(keep_rows).reset_index(drop=True)
 
+        # Optional CPU-RAM cache to avoid repeating expensive PIL decode/resize
+        # and normalization on every epoch. This is usually the best "easy"
+        # speed-up before attempting anything GPU-memory related.
+        #
+        # NOTE: Default is off to avoid large RAM usage.
+        self.enable_cache = False
+        self._cache = {}  # type: Dict[int, torch.Tensor]
+
         if transforms is None:
             # Fallback if torchvision isn't importable.
             self.image_size = (self.image_size, self.image_size)
@@ -56,6 +65,12 @@ class SimplePlantDataset(Dataset):
         return len(self.df)
 
     def __getitem__(self, idx):
+        if self.enable_cache and idx in self._cache:
+            rgb = self._cache[idx]
+            dry_weight = float(self.df.iloc[idx]['DryWeightShoot'])
+            variety_class = int(self.df.iloc[idx]['VarietyClass'])
+            return rgb, torch.tensor(dry_weight, dtype=torch.float32), torch.tensor(variety_class, dtype=torch.long)
+
         rgb_path = self.df.iloc[idx]['rgb_path']
 
         rgb_img = Image.open(rgb_path).convert('RGB')
@@ -72,4 +87,20 @@ class SimplePlantDataset(Dataset):
 
         dry_weight = torch.tensor(dry_weight, dtype=torch.float32)
         variety_class = torch.tensor(variety_class, dtype=torch.long)
+
+        if self.enable_cache:
+            # Keep tensors on CPU; DataLoader can pin memory and transfer async.
+            self._cache[idx] = rgb
         return rgb, dry_weight, variety_class
+
+    def build_cache(self, max_items: Optional[int] = None):
+        """Precompute and store preprocessed tensors in CPU RAM.
+
+        This can significantly speed up training when the disk/CPU pipeline is
+        the bottleneck. It does NOT move data to GPU (VRAM) because that rarely
+        fits for real datasets and prevents multi-worker loading.
+        """
+        self.enable_cache = True
+        n = len(self) if max_items is None else min(len(self), max_items)
+        for i in range(n):
+            _ = self[i]

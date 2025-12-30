@@ -74,6 +74,10 @@ def main():
         generator=torch.Generator().manual_seed(42)
     )
 
+    # Build cache for faster loading if desired
+    full_dataset.enable_cache = True
+    full_dataset.build_cache()
+
     # On Windows you MUST guard entrypoint when using num_workers>0.
     # Keep 0 as a safe default; you can increase once everything works.
     num_workers = 0 if os.name == 'nt' else 2
@@ -84,6 +88,7 @@ def main():
     # Model, Loss, Optimizer
     num_classes = len(full_dataset.variety2idx)
     model = SimpleResNetModel(num_classes=num_classes).to(DEVICE)
+
 
     criterion_reg = nn.MSELoss()
     criterion_class = nn.CrossEntropyLoss()
