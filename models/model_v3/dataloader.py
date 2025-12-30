@@ -19,14 +19,8 @@ class SimplePlantDataset(Dataset):
         self.df = pd.read_csv(labels_file)
         if 'image_id' in self.df.columns:
             self.df.rename(columns={'image_id': 'id'}, inplace=True)
-        if 'Variety' not in self.df.columns:
-            raise ValueError("CSV must contain a 'Variety' column for classification")
         if 'DryWeightShoot' not in self.df.columns:
             raise ValueError("CSV must contain a 'DryWeightShoot' column for regression")
-
-        self.variety2idx = {v: i for i, v in enumerate(sorted(self.df['Variety'].unique()))}
-        self.df['VarietyClass'] = self.df['Variety'].map(self.variety2idx)
-        print(f"Variety to class mapping: {self.variety2idx}")
 
         keep_rows = []
         for _, row in self.df.iterrows():
@@ -68,8 +62,7 @@ class SimplePlantDataset(Dataset):
         if self.enable_cache and idx in self._cache:
             rgb = self._cache[idx]
             dry_weight = float(self.df.iloc[idx]['DryWeightShoot'])
-            variety_class = int(self.df.iloc[idx]['VarietyClass'])
-            return rgb, torch.tensor(dry_weight, dtype=torch.float32), torch.tensor(variety_class, dtype=torch.long)
+            return rgb, torch.tensor(dry_weight, dtype=torch.float32)
 
         rgb_path = self.df.iloc[idx]['rgb_path']
 
@@ -83,15 +76,12 @@ class SimplePlantDataset(Dataset):
             rgb = (rgb - self._mean) / self._std
 
         dry_weight = float(self.df.iloc[idx]['DryWeightShoot'])
-        variety_class = int(self.df.iloc[idx]['VarietyClass'])
-
         dry_weight = torch.tensor(dry_weight, dtype=torch.float32)
-        variety_class = torch.tensor(variety_class, dtype=torch.long)
 
         if self.enable_cache:
             # Keep tensors on CPU; DataLoader can pin memory and transfer async.
             self._cache[idx] = rgb
-        return rgb, dry_weight, variety_class
+        return rgb, dry_weight
 
     def build_cache(self, max_items: Optional[int] = None):
         """Precompute and store preprocessed tensors in CPU RAM.

@@ -18,7 +18,7 @@ def _create_resnet18(pretrained: bool = True):
     return models.resnet18(pretrained=True)
 
 class SimpleResNetModel(nn.Module):
-    def __init__(self, num_classes=3):
+    def __init__(self):
         super(SimpleResNetModel, self).__init__()
         # Default: the intended baseline (ResNet18).
         # If torchvision can't be imported in a user's environment, we fall
@@ -55,11 +55,6 @@ class SimpleResNetModel(nn.Module):
             nn.ReLU(inplace=True),
             nn.Linear(128, 1),
         )
-        self.class_head = nn.Sequential(
-            nn.Linear(feat_dim, 128),
-            nn.ReLU(inplace=True),
-            nn.Linear(128, num_classes),
-        )
     def forward(self, x):
         if self.resnet is not None:
             feats = self.resnet(x)
@@ -67,5 +62,4 @@ class SimpleResNetModel(nn.Module):
             feats = self.backbone(x)
             feats = torch.flatten(feats, 1)
         reg_out = self.reg_head(feats)
-        class_out = self.class_head(feats)
-        return reg_out, class_out
+        return reg_out
