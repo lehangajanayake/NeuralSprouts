@@ -51,11 +51,12 @@ def seed_everything(seed: int = 42, deterministic: bool = True):
     if deterministic:
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
-        try:
-            torch.use_deterministic_algorithms(True)
-        except Exception:
-            print("[warn] torch.use_deterministic_algorithms not supported, continuing without it")
-            torch.use_deterministic_algorithms(False)
+        uda = getattr(torch, 'use_deterministic_algorithms', None)
+        if callable(uda):
+            try:
+                uda(True)
+            except Exception as e:
+                print(f"[warn] couldn't enable strict deterministic algorithms ({type(e).__name__}: {e}); continuing without it")
 
 def seed_worker(worker_id: int):
     worker_seed = torch.initial_seed() % 2**32
