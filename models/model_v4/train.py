@@ -64,7 +64,17 @@ def seed_worker(worker_id: int):
 
 
 def make_loaders(cfg: TrainConfig) -> Tuple[DataLoader, DataLoader, Dict[str, int]]:
-    full = PlantDatasetV4(cfg.rgb_dir, cfg.depth_dir, cfg.train_csv, augment=True, seed=cfg.seed)
+    # Cache preprocessed tensors in CPU RAM to reduce per-epoch PIL decode/resize overhead.
+    # This typically improves GPU utilization more reliably than trying to preload everything into VRAM.
+    full = PlantDatasetV4(
+        cfg.rgb_dir,
+        cfg.depth_dir,
+        cfg.train_csv,
+        augment=True,
+        seed=cfg.seed,
+        enable_cache=True,
+        num_views=1,
+    )
 
     val_size = int(len(full) * float(cfg.val_ratio))
     train_size = len(full) - val_size
@@ -78,6 +88,16 @@ def make_loaders(cfg: TrainConfig) -> Tuple[DataLoader, DataLoader, Dict[str, in
     pin_memory = torch.cuda.is_available()
     g = torch.Generator().manual_seed(cfg.seed)
 
+    # Optional: build cache once up-front to avoid lazy cache misses during epoch 1.
+    # Set max_base_items to an int to limit RAM usage.
+    full.build_cache(max_base_items=None)
+
+    loader_kwargs = {}
+    # persistent_workers only applies when num_workers > 0
+    if num_workers > 0:
+        loader_kwargs['persistent_workers'] = True
+        loader_kwargs['prefetch_factor'] = 2
+
     train_loader = DataLoader(
         train_ds,
         batch_size=cfg.batch_size,
@@ -86,6 +106,7 @@ def make_loaders(cfg: TrainConfig) -> Tuple[DataLoader, DataLoader, Dict[str, in
         pin_memory=pin_memory,
         worker_init_fn=seed_worker,
         generator=g,
+        **loader_kwargs,
     )
     val_loader = DataLoader(
         val_ds,
@@ -95,6 +116,7 @@ def make_loaders(cfg: TrainConfig) -> Tuple[DataLoader, DataLoader, Dict[str, in
         pin_memory=pin_memory,
         worker_init_fn=seed_worker,
         generator=g,
+        **loader_kwargs,
     )
 
     meta = {
@@ -145,9 +167,9 @@ def stage1_train_rgb_classifier(cfg: TrainConfig, model: LettuceMultiBranchCNN, 
         train_loss_sum, n_train = 0.0, 0
 
         for batch in train_loader:
-            rgb = batch['rgb'].to(device)
-            rgbd = batch['rgbd'].to(device)
-            y_cls = batch['variety_class'].to(device)
+            rgb = batch['rgb'].to(device, non_blocking=True)
+            rgbd = batch['rgbd'].to(device, non_blocking=True)
+            y_cls = batch['variety_class'].to(device, non_blocking=True)
 
             optimizer.zero_grad(set_to_none=True)
             logits, _, _ = model(rgb, rgbd)
@@ -163,9 +185,9 @@ def stage1_train_rgb_classifier(cfg: TrainConfig, model: LettuceMultiBranchCNN, 
         val_loss_sum, n_val = 0.0, 0
         with torch.no_grad():
             for batch in val_loader:
-                rgb = batch['rgb'].to(device)
-                rgbd = batch['rgbd'].to(device)
-                y_cls = batch['variety_class'].to(device)
+                rgb = batch['rgb'].to(device, non_blocking=True)
+                rgbd = batch['rgbd'].to(device, non_blocking=True)
+                y_cls = batch['variety_class'].to(device, non_blocking=True)
 
                 logits, _, _ = model(rgb, rgbd)
                 loss = criterion(logits, y_cls)
@@ -202,9 +224,9 @@ def stage2_train_rgbd_regressor(cfg: TrainConfig, model: LettuceMultiBranchCNN, 
         train_mae_sum, n_train = 0.0, 0
 
         for batch in train_loader:
-            rgb = batch['rgb'].to(device)
-            rgbd = batch['rgbd'].to(device)
-            y = batch['dry_weight'].to(device)
+            rgb = batch['rgb'].to(device, non_blocking=True)
+            rgbd = batch['rgbd'].to(device, non_blocking=True)
+            y = batch['dry_weight'].to(device, non_blocking=True)
 
             optimizer.zero_grad(set_to_none=True)
             _, rgbd_pred, _ = model(rgb, rgbd)
@@ -220,9 +242,9 @@ def stage2_train_rgbd_regressor(cfg: TrainConfig, model: LettuceMultiBranchCNN, 
         val_mae_sum, n_val = 0.0, 0
         with torch.no_grad():
             for batch in val_loader:
-                rgb = batch['rgb'].to(device)
-                rgbd = batch['rgbd'].to(device)
-                y = batch['dry_weight'].to(device)
+                rgb = batch['rgb'].to(device, non_blocking=True)
+                rgbd = batch['rgbd'].to(device, non_blocking=True)
+                y = batch['dry_weight'].to(device, non_blocking=True)
 
                 _, rgbd_pred, _ = model(rgb, rgbd)
                 loss = criterion(rgbd_pred, y)
@@ -259,9 +281,9 @@ def stage3_train_fusion(cfg: TrainConfig, model: LettuceMultiBranchCNN, train_lo
         train_mae_sum, n_train = 0.0, 0
 
         for batch in train_loader:
-            rgb = batch['rgb'].to(device)
-            rgbd = batch['rgbd'].to(device)
-            y = batch['dry_weight'].to(device)
+            rgb = batch['rgb'].to(device, non_blocking=True)
+            rgbd = batch['rgbd'].to(device, non_blocking=True)
+            y = batch['dry_weight'].to(device, non_blocking=True)
 
             optimizer.zero_grad(set_to_none=True)
             _, _, fusion_pred = model(rgb, rgbd)
@@ -277,9 +299,9 @@ def stage3_train_fusion(cfg: TrainConfig, model: LettuceMultiBranchCNN, train_lo
         val_mae_sum, n_val = 0.0, 0
         with torch.no_grad():
             for batch in val_loader:
-                rgb = batch['rgb'].to(device)
-                rgbd = batch['rgbd'].to(device)
-                y = batch['dry_weight'].to(device)
+                rgb = batch['rgb'].to(device, non_blocking=True)
+                rgbd = batch['rgbd'].to(device, non_blocking=True)
+                y = batch['dry_weight'].to(device, non_blocking=True)
 
                 _, _, fusion_pred = model(rgb, rgbd)
                 loss = criterion(fusion_pred, y)

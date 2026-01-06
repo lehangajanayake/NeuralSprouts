@@ -1,5 +1,5 @@
 import os
-from typing import Tuple
+from typing import Dict, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -51,6 +51,8 @@ class PlantDatasetV4(Dataset):
         image_size: int = 64,
         augment: bool = False,
         seed: int = 42,
+        enable_cache: bool = False,
+        num_views: int = 1,
     ):
         self.rgb_dir = rgb_dir
         self.depth_dir = depth_dir
@@ -58,6 +60,14 @@ class PlantDatasetV4(Dataset):
         self.image_size = int(image_size)
         self.augment = bool(augment)
         self.seed = int(seed)
+        self.enable_cache = bool(enable_cache)
+        self.num_views = int(num_views)
+        if self.num_views < 1:
+            self.num_views = 1
+
+        # Cache: keep tensors on CPU RAM; DataLoader pin_memory=True speeds non_blocking H2D copies.
+        # Keyed by (base_idx, view_idx). When num_views > 1, __len__ expands to N * num_views.
+        self._cache: Dict[Tuple[int, int], Dict[str, torch.Tensor]] = {}
 
         self.df = pd.read_csv(labels_csv)
         if 'image_id' in self.df.columns:
@@ -93,14 +103,25 @@ class PlantDatasetV4(Dataset):
             self.color_jitter = T.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.02)
 
     def __len__(self) -> int:
-        return len(self.df)
+        base_len = len(self.df)
+        if self.num_views > 1:
+            return base_len * self.num_views
+        return base_len
 
-    def _maybe_aug(self, rgb: Image.Image, depth: Image.Image, idx: int) -> Tuple[Image.Image, Image.Image]:
+    def _map_index(self, global_idx: int) -> Tuple[int, int]:
+        base_len = len(self.df)
+        if self.num_views > 1:
+            base_idx = int(global_idx) % base_len
+            view_idx = int(global_idx) // base_len
+            return base_idx, view_idx
+        return int(global_idx), 0
+
+    def _maybe_aug(self, rgb: Image.Image, depth: Image.Image, base_idx: int, view_idx: int) -> Tuple[Image.Image, Image.Image]:
         if not self.augment or T is None:
             return rgb, depth
 
-        # deterministic-ish per index
-        rng = np.random.RandomState(self.seed + int(idx) * 9973)
+        # deterministic per (base_idx, view_idx)
+        rng = np.random.RandomState(self.seed + int(base_idx) * 9973 + int(view_idx) * 101)
 
         # flips
         if rng.rand() < 0.5:
@@ -122,7 +143,14 @@ class PlantDatasetV4(Dataset):
         return rgb, depth
 
     def __getitem__(self, idx: int):
-        row = self.df.iloc[int(idx)]
+        base_idx, view_idx = self._map_index(idx)
+
+        if self.enable_cache:
+            key = (base_idx, view_idx)
+            if key in self._cache:
+                return self._cache[key]
+
+        row = self.df.iloc[int(base_idx)]
         rgb_path = row['rgb_path']
         depth_path = row['depth_path']
 
@@ -132,7 +160,7 @@ class PlantDatasetV4(Dataset):
         rgb = _center_crop_900(rgb)
         depth = _center_crop_900(depth)
 
-        rgb, depth = self._maybe_aug(rgb, depth, idx)
+        rgb, depth = self._maybe_aug(rgb, depth, base_idx, view_idx)
 
         if self.resize is not None:
             rgb = self.resize(rgb)
@@ -156,9 +184,32 @@ class PlantDatasetV4(Dataset):
         dry_weight = torch.tensor(float(row['DryWeightShoot']), dtype=torch.float32)
 
         # Return plain tensors in a dict so PyTorch's default_collate can batch them.
-        return {
+        sample = {
             'rgb': rgb_t,
             'rgbd': rgbd_t,
             'variety_class': variety_class,
             'dry_weight': dry_weight,
         }
+
+        if self.enable_cache:
+            # Keep CPU tensors; DataLoader can pin them for faster H2D transfers.
+            self._cache[(base_idx, view_idx)] = sample
+
+        return sample
+
+    def build_cache(self, max_base_items: Optional[int] = None) -> None:
+        """Precompute and store preprocessed tensors in CPU RAM.
+
+        This speeds up training when image decode/resize is the bottleneck.
+        If num_views > 1 and augment=True, it stores multiple deterministic augmented views per image.
+        """
+        self.enable_cache = True
+
+        base_len = len(self.df)
+        n = base_len if max_base_items is None else min(base_len, int(max_base_items))
+
+        for base_idx in range(n):
+            views = self.num_views if self.num_views > 1 else 1
+            for view_idx in range(views):
+                global_idx = base_idx + view_idx * base_len
+                _ = self.__getitem__(global_idx)
