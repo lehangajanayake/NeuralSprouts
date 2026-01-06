@@ -1,7 +1,9 @@
 import os
 import random
+import concurrent.futures as cf
+import math
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -29,6 +31,11 @@ class PreprocessConfig:
     # how many augmented variants per original (not counting the original)
     num_aug_per_image: int = 3
     seed: int = 42
+
+    # Parallelism / speed knobs
+    # Use processes (not threads) to bypass the GIL for CPU-heavy image decode/resize.
+    num_workers: Optional[int] = None  # default computed in main()
+    max_items: Optional[int] = None  # optionally limit number of originals processed
 
 
 def seed_everything(seed: int) -> None:
@@ -85,6 +92,62 @@ def preprocess_one(rgb: Image.Image, depth: Image.Image, cfg: PreprocessConfig) 
     return rgb, depth
 
 
+def _process_one_row(args) -> List[Dict]:
+    """Worker function: process one original row and return CSV rows for (original + aug variants).
+
+    Notes:
+    - Must be top-level for Windows multiprocessing.
+    - Uses deterministic output ids computed from the row_index, so results are stable
+      regardless of worker completion order.
+    """
+
+    row_index, row_dict, cfg_dict = args
+    cfg = PreprocessConfig(**cfg_dict)
+
+    orig_id = int(row_dict['id'])
+    rgb_path = os.path.join(cfg.train_rgb_dir, f'RGB_{orig_id}.png')
+    depth_path = os.path.join(cfg.train_depth_dir, f'Depth_{orig_id}.png')
+    if not os.path.exists(rgb_path) or not os.path.exists(depth_path):
+        return []
+
+    try:
+        rgb0 = Image.open(rgb_path).convert('RGB')
+        depth0 = Image.open(depth_path).convert('L')
+    except Exception:
+        return []
+
+    # Deterministic id allocation: each original produces (1 + num_aug_per_image) outputs
+    per = 1 + int(cfg.num_aug_per_image)
+    base_out_id = int(row_index) * per + 1
+
+    out_rows: List[Dict] = []
+
+    # original (no aug)
+    rgb, depth = preprocess_one(rgb0, depth0, cfg)
+    rgb.save(os.path.join(cfg.out_rgb_dir, f'RGB_{base_out_id}.png'))
+    depth.save(os.path.join(cfg.out_depth_dir, f'Depth_{base_out_id}.png'))
+    r0 = dict(row_dict)
+    r0['id'] = base_out_id
+    out_rows.append(r0)
+
+    # augmented variants
+    for k in range(int(cfg.num_aug_per_image)):
+        out_id = base_out_id + 1 + k
+
+        rng = np.random.RandomState(int(cfg.seed) + orig_id * 100 + k)
+        rgb_aug, depth_aug = apply_aug(rgb0, depth0, rng)
+        rgb_aug, depth_aug = preprocess_one(rgb_aug, depth_aug, cfg)
+
+        rgb_aug.save(os.path.join(cfg.out_rgb_dir, f'RGB_{out_id}.png'))
+        depth_aug.save(os.path.join(cfg.out_depth_dir, f'Depth_{out_id}.png'))
+
+        rk = dict(row_dict)
+        rk['id'] = out_id
+        out_rows.append(rk)
+
+    return out_rows
+
+
 def main(cfg: Optional[PreprocessConfig] = None) -> None:
     cfg = cfg or PreprocessConfig()
     seed_everything(cfg.seed)
@@ -101,41 +164,51 @@ def main(cfg: Optional[PreprocessConfig] = None) -> None:
     if missing:
         raise ValueError(f"Training CSV missing columns: {sorted(missing)}")
 
-    aug_rows = []
-    next_id = 1
+    # Optionally limit number of originals
+    if cfg.max_items is not None:
+        df = df.iloc[: int(cfg.max_items)].reset_index(drop=True)
 
-    for i, row in df.iterrows():
-        orig_id = int(row['id'])
-        rgb_path = os.path.join(cfg.train_rgb_dir, f'RGB_{orig_id}.png')
-        depth_path = os.path.join(cfg.train_depth_dir, f'Depth_{orig_id}.png')
-        if not os.path.exists(rgb_path) or not os.path.exists(depth_path):
-            continue
+    # Compute default worker count
+    if cfg.num_workers is None:
+        cpu = os.cpu_count() or 1
+        # leave 1 core for OS/UI; minimum 1 worker
+        cfg.num_workers = max(1, cpu - 1)
+    cfg.num_workers = max(1, int(cfg.num_workers))
 
-        rgb0 = Image.open(rgb_path).convert('RGB')
-        depth0 = Image.open(depth_path).convert('L')
+    # Send a plain dict to workers (dataclasses aren't always pickle-friendly between processes)
+    cfg_dict = {
+        'train_rgb_dir': cfg.train_rgb_dir,
+        'train_depth_dir': cfg.train_depth_dir,
+        'labels_csv': cfg.labels_csv,
+        'out_rgb_dir': cfg.out_rgb_dir,
+        'out_depth_dir': cfg.out_depth_dir,
+        'out_csv': cfg.out_csv,
+        'image_size': cfg.image_size,
+        'crop_size': cfg.crop_size,
+        'num_aug_per_image': cfg.num_aug_per_image,
+        'seed': cfg.seed,
+        'num_workers': cfg.num_workers,
+        'max_items': cfg.max_items,
+    }
 
-        # original (no aug)
-        rgb, depth = preprocess_one(rgb0, depth0, cfg)
-        rgb.save(os.path.join(cfg.out_rgb_dir, f'RGB_{next_id}.png'))
-        depth.save(os.path.join(cfg.out_depth_dir, f'Depth_{next_id}.png'))
-        aug_rows.append({**row.to_dict(), 'id': next_id})
-        next_id += 1
+    tasks = [(i, row.to_dict(), cfg_dict) for i, (_, row) in enumerate(df.iterrows())]
+    total = len(tasks)
+    per = 1 + int(cfg.num_aug_per_image)
+    print(f"Parallel preprocessing: originals={total}, outputs per original={per}, workers={cfg.num_workers}")
 
-        # augmented variants
-        for k in range(cfg.num_aug_per_image):
-            rng = np.random.RandomState(cfg.seed + orig_id * 100 + k)
-            rgb_aug, depth_aug = apply_aug(rgb0, depth0, rng)
-            rgb_aug, depth_aug = preprocess_one(rgb_aug, depth_aug, cfg)
+    all_rows: List[Dict] = []
+    done = 0
 
-            rgb_aug.save(os.path.join(cfg.out_rgb_dir, f'RGB_{next_id}.png'))
-            depth_aug.save(os.path.join(cfg.out_depth_dir, f'Depth_{next_id}.png'))
-            aug_rows.append({**row.to_dict(), 'id': next_id})
-            next_id += 1
+    # Use processes: fastest for PIL decode/resize
+    with cf.ProcessPoolExecutor(max_workers=cfg.num_workers) as ex:
+        for out_rows in ex.map(_process_one_row, tasks, chunksize=8):
+            if out_rows:
+                all_rows.extend(out_rows)
+            done += 1
+            if done % 25 == 0 or done == total:
+                print(f"Processed {done}/{total} originals...")
 
-        if (i + 1) % 25 == 0:
-            print(f"Processed {i+1}/{len(df)} originals...")
-
-    out_df = pd.DataFrame(aug_rows)
+    out_df = pd.DataFrame(all_rows)
     out_df.to_csv(cfg.out_csv, index=False)
     print(f"Augmented images saved to: {cfg.out_rgb_dir} and {cfg.out_depth_dir}")
     print(f"Augmented CSV saved to: {cfg.out_csv} (rows={len(out_df)})")
