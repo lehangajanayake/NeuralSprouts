@@ -54,8 +54,8 @@ def seed_everything(seed: int = 42, deterministic: bool = True):
         try:
             torch.use_deterministic_algorithms(True)
         except Exception:
-            pass
-
+            print("[warn] torch.use_deterministic_algorithms not supported, continuing without it")
+            torch.use_deterministic_algorithms(False)
 
 def seed_worker(worker_id: int):
     worker_seed = torch.initial_seed() % 2**32
