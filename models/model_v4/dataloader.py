@@ -213,3 +213,80 @@ class PlantDatasetV4(Dataset):
             for view_idx in range(views):
                 global_idx = base_idx + view_idx * base_len
                 _ = self.__getitem__(global_idx)
+
+
+class TestPlantDatasetV4(Dataset):
+    """Dataset for test/inference.
+
+    Expects a CSV containing `image_id` or `id`.
+    Loads RGB and Depth images, applies mandatory crop/resize, returns tensors and the id.
+    """
+
+    def __init__(
+        self,
+        rgb_dir: str,
+        depth_dir: str,
+        csv_file: str,
+        *,
+        image_size: int = 64,
+    ):
+        self.rgb_dir = rgb_dir
+        self.depth_dir = depth_dir
+        self.csv_file = csv_file
+        self.image_size = int(image_size)
+
+        df = pd.read_csv(csv_file)
+        if 'image_id' in df.columns:
+            df.rename(columns={'image_id': 'id'}, inplace=True)
+        if 'id' not in df.columns:
+            raise ValueError("Test CSV must contain 'image_id' or 'id'")
+
+        keep = []
+        for _, row in df.iterrows():
+            image_id = int(row['id'])
+            rgb_path = os.path.join(self.rgb_dir, f"RGB_{image_id}.png")
+            depth_path = os.path.join(self.depth_dir, f"Depth_{image_id}.png")
+            if not os.path.exists(rgb_path) or not os.path.exists(depth_path):
+                continue
+            keep.append({'id': image_id, 'rgb_path': rgb_path, 'depth_path': depth_path})
+        self.df = pd.DataFrame(keep)
+
+        if T is None:
+            self.resize = None
+        else:
+            self.resize = T.Resize((self.image_size, self.image_size))
+
+    def __len__(self) -> int:
+        return len(self.df)
+
+    def __getitem__(self, idx: int):
+        row = self.df.iloc[int(idx)]
+        image_id = int(row['id'])
+
+        rgb = Image.open(row['rgb_path']).convert('RGB')
+        depth = Image.open(row['depth_path']).convert('L')
+
+        rgb = _center_crop_900(rgb)
+        depth = _center_crop_900(depth)
+
+        if self.resize is not None:
+            rgb = self.resize(rgb)
+            depth = self.resize(depth)
+        else:
+            rgb = rgb.resize((self.image_size, self.image_size), resample=Image.BILINEAR)
+            depth = depth.resize((self.image_size, self.image_size), resample=Image.BILINEAR)
+
+        rgb_np = np.asarray(rgb, dtype=np.float32) / 255.0
+        depth_np = np.asarray(depth, dtype=np.float32) / 255.0
+        if depth_np.ndim == 2:
+            depth_np = depth_np[..., None]
+
+        rgb_t = torch.from_numpy(rgb_np).permute(2, 0, 1).contiguous()
+        depth_t = torch.from_numpy(depth_np).permute(2, 0, 1).contiguous()
+        rgbd_t = torch.cat([rgb_t, depth_t], dim=0)
+
+        return {
+            'id': torch.tensor(image_id, dtype=torch.long),
+            'rgb': rgb_t,
+            'rgbd': rgbd_t,
+        }
