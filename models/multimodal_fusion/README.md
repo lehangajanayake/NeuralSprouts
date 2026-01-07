@@ -1,5 +1,58 @@
 # Multimodal Fusion Model for Lettuce Dry Weight Prediction
 
+## Model Description
+
+**Multimodal Fusion Model** is the most sophisticated architecture in the NeuralSprouts project, implementing state-of-the-art deep learning techniques for robust lettuce phenotyping. This model combines modern backbone architectures, semantic segmentation, and phenotype-based feature extraction in an end-to-end learnable framework.
+
+### Architecture Overview
+
+1. **Dual Encoder Design**
+   - **RGB Encoder**: ConvNeXt or EfficientNet backbone
+   - **Depth Encoder**: ConvNeXt or EfficientNet backbone
+   - Both encoders process inputs independently and extract high-level features
+   
+2. **Mid-level Fusion Module**
+   - Combines RGB and Depth features at intermediate representations
+   - Enables multimodal interaction before task-specific heads
+   - Preserves modality-specific information while learning cross-modal patterns
+
+3. **Multi-task Heads**
+   - **Segmentation Head**: Predicts binary lettuce masks (foreground/background)
+     - Loss: Combined BCE + Dice loss for robust segmentation
+     - Output: Pixel-wise lettuce probability maps
+   
+   - **Regression Head**: Predicts dry weight from fused features
+     - Loss: Huber loss (robust to outliers)
+     - Output: Direct dry weight estimate
+
+4. **Phenotype Feature Extraction**
+   - Extracts interpretable features from predicted segmentation masks:
+     - Area fraction (percentage of image covered)
+     - Bounding box dimensions (width, height)
+     - Equivalent diameter (circular approximation)
+     - Depth statistics (mean, std, median within mask region)
+   
+5. **Learnable Blending Network**
+   - Input: Deep regression prediction + 7 phenotype features
+   - 2-layer MLP combines deep learning and traditional features
+   - Output: Final refined dry weight prediction
+   - Learns optimal weighting between model-based and feature-based predictions
+
+### Key Innovations
+- **Hybrid Prediction**: Combines deep learning with classical phenotype features
+- **Robust Training**: Huber loss, gradient clipping, mixed precision (AMP)
+- **K-fold Cross-Validation**: 5-fold CV for reliable performance estimation
+- **Ensemble Inference**: Averages predictions from all folds
+- **Modern Backbones**: ConvNeXt/EfficientNet for strong feature extraction
+- **Interpretability**: Phenotype features provide explainable predictions
+
+### Training Strategy
+- Multi-task optimization (segmentation + regression)
+- Cosine annealing learning rate schedule
+- Early stopping with patience
+- Gradient clipping for stability
+- Mixed precision training for efficiency
+
 A complete PyTorch implementation of a multimodal multi-task deep learning system for predicting lettuce dry shoot weight from RGB and Depth images.
 
 ## Features

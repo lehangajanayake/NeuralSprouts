@@ -1,5 +1,46 @@
 # model_v4 — multi-branch CNN + viewer
 
+## Model Description
+
+**Model v4** implements an advanced multi-branch architecture with staged training and feature fusion, representing a significant evolution in the model series. This model introduces a fusion network that combines classification and regression features for improved dry weight prediction.
+
+### Architecture Overview
+The model consists of three coordinated components:
+
+1. **RGB Classification Branch**
+   - Input: 3×64×64 RGB images
+   - Architecture: 4 convolutional blocks (32→64→128→256 filters)
+   - Output: 4-class lettuce variety logits
+   - Role: Extracts variety-specific features
+
+2. **RGBD Regression Branch**
+   - Input: 4×64×64 (RGB + Depth concatenated)
+   - Architecture: 4 convolutional blocks (32→64→128→256 filters)
+   - Output: Initial dry weight estimate (single scalar)
+   - Role: Direct regression from multimodal input
+
+3. **Fusion Network**
+   - Input: Concatenated features (4 variety logits + 1 regression value = 5 features)
+   - Architecture: 2-layer MLP (hidden_dim=32)
+   - Output: Final refined dry weight prediction
+   - Role: Combines classification and regression information for improved accuracy
+
+### Key Innovations
+- **Staged Training Strategy**: Three-phase training for optimal convergence
+  - **Stage 1**: Train RGB branch only (variety classification)
+  - **Stage 2**: Train RGBD branch only (dry weight regression)
+  - **Stage 3**: Fine-tune fusion network with frozen/unfrozen branches
+  
+- **Feature Fusion**: Leverages both variety identity and direct regression
+- **Multi-task Learning**: Implicitly uses classification to improve regression
+- **Flexible Architecture**: Allows branch-specific freezing/unfreezing
+
+### Training Strategy
+- Early stopping per stage
+- Separate checkpoints for each branch (`best_rgb_branch_v4.pth`, `best_rgbd_branch_v4.pth`)
+- Final unified checkpoint (`best_model_v4.pth`)
+- Primary metric: MAE on fusion output
+
 This folder contains **Model v4** (multi-branch CNN: RGB classification + RGBD regression + fusion dry-weight prediction) and a fast viewer to inspect paired RGB/Depth images side-by-side.
 
 ## Model v4 (training + evaluation)
