@@ -158,6 +158,10 @@ def stage1_train_rgb_classifier(cfg: TrainConfig, model: LettuceMultiBranchCNN, 
 
     best_path = str(Path(cfg.out_dir) / 'best_rgb_branch_v4.pth')
 
+    # Track history for plotting
+    train_hist, val_hist = [], []
+    best_epoch = -1
+
     for epoch in range(cfg.num_epochs_stage1):
         model.train()
         train_loss_sum, n_train = 0.0, 0
@@ -191,16 +195,20 @@ def stage1_train_rgb_classifier(cfg: TrainConfig, model: LettuceMultiBranchCNN, 
                 val_loss_sum += loss.item() * bs
                 n_val += bs
 
+        train_ce = train_loss_sum / max(1, n_train)
         val_loss = val_loss_sum / max(1, n_val)
-        print(f"[stage1] epoch {epoch+1}/{cfg.num_epochs_stage1} train_ce={train_loss_sum/max(1,n_train):.4f} val_ce={val_loss:.4f}")
+        train_hist.append(train_ce)
+        val_hist.append(val_loss)
+        print(f"[stage1] epoch {epoch+1}/{cfg.num_epochs_stage1} train_ce={train_ce:.4f} val_ce={val_loss:.4f}")
 
         if val_loss <= stopper.best:
             save_checkpoint(best_path, model)
+            best_epoch = epoch + 1
         if stopper.step(val_loss):
             print(f"[stage1] early stop at epoch {epoch+1} (best val_ce={stopper.best:.4f})")
             break
 
-    return best_path
+    return best_path, {"train": train_hist, "val": val_hist, "best_epoch": best_epoch}
 
 
 def stage2_train_rgbd_regressor(cfg: TrainConfig, model: LettuceMultiBranchCNN, train_loader, val_loader, device):
@@ -214,6 +222,10 @@ def stage2_train_rgbd_regressor(cfg: TrainConfig, model: LettuceMultiBranchCNN, 
     stopper = EarlyStopper(cfg.patience_stage2)
 
     best_path = str(Path(cfg.out_dir) / 'best_rgbd_branch_v4.pth')
+
+    # Track history for plotting
+    train_hist, val_hist = [], []
+    best_epoch = -1
 
     for epoch in range(cfg.num_epochs_stage2):
         model.train()
@@ -248,16 +260,20 @@ def stage2_train_rgbd_regressor(cfg: TrainConfig, model: LettuceMultiBranchCNN, 
                 val_mae_sum += loss.item() * bs
                 n_val += bs
 
+        train_mae = train_mae_sum / max(1, n_train)
         val_mae = val_mae_sum / max(1, n_val)
-        print(f"[stage2] epoch {epoch+1}/{cfg.num_epochs_stage2} train_mae={train_mae_sum/max(1,n_train):.4f} val_mae={val_mae:.4f}")
+        train_hist.append(train_mae)
+        val_hist.append(val_mae)
+        print(f"[stage2] epoch {epoch+1}/{cfg.num_epochs_stage2} train_mae={train_mae:.4f} val_mae={val_mae:.4f}")
 
         if val_mae <= stopper.best:
             save_checkpoint(best_path, model)
+            best_epoch = epoch + 1
         if stopper.step(val_mae):
             print(f"[stage2] early stop at epoch {epoch+1} (best val_mae={stopper.best:.4f})")
             break
 
-    return best_path
+    return best_path, {"train": train_hist, "val": val_hist, "best_epoch": best_epoch}
 
 
 def stage3_train_fusion(cfg: TrainConfig, model: LettuceMultiBranchCNN, train_loader, val_loader, device):
@@ -271,6 +287,10 @@ def stage3_train_fusion(cfg: TrainConfig, model: LettuceMultiBranchCNN, train_lo
     stopper = EarlyStopper(cfg.patience_stage3)
 
     best_path = str(Path(cfg.out_dir) / 'best_model_v4.pth')
+
+    # Track history for plotting
+    train_hist, val_hist = [], []
+    best_epoch = -1
 
     for epoch in range(cfg.num_epochs_stage3):
         model.train()
@@ -305,16 +325,76 @@ def stage3_train_fusion(cfg: TrainConfig, model: LettuceMultiBranchCNN, train_lo
                 val_mae_sum += loss.item() * bs
                 n_val += bs
 
+        train_mae = train_mae_sum / max(1, n_train)
         val_mae = val_mae_sum / max(1, n_val)
-        print(f"[stage3] epoch {epoch+1}/{cfg.num_epochs_stage3} train_mae={train_mae_sum/max(1,n_train):.4f} val_mae={val_mae:.4f}")
+        train_hist.append(train_mae)
+        val_hist.append(val_mae)
+        print(f"[stage3] epoch {epoch+1}/{cfg.num_epochs_stage3} train_mae={train_mae:.4f} val_mae={val_mae:.4f}")
 
         if val_mae <= stopper.best:
             save_checkpoint(best_path, model)
+            best_epoch = epoch + 1
         if stopper.step(val_mae):
             print(f"[stage3] early stop at epoch {epoch+1} (best val_mae={stopper.best:.4f})")
             break
 
-    return best_path
+    return best_path, {"train": train_hist, "val": val_hist, "best_epoch": best_epoch}
+
+
+def _plot_histories(stage_histories, out_dir: str):
+    """Plot histories for all stages and save PNGs.
+
+    stage_histories: List of tuples (title, y_label, hist_dict)
+    where hist_dict has keys 'train', 'val', 'best_epoch'.
+    """
+    try:
+        import matplotlib.pyplot as plt
+    except Exception as e:
+        print("[plot] matplotlib not available. Install with: pip install matplotlib")
+        print(f"[plot] Skipping plots. Reason: {e}")
+        return
+
+    # Composite figure
+    n = len(stage_histories)
+    fig, axes = plt.subplots(n, 1, figsize=(8, 3.0 * n), constrained_layout=True)
+    if n == 1:
+        axes = [axes]
+
+    for ax, (title, y_label, hist) in zip(axes, stage_histories):
+        epochs = range(1, len(hist["train"]) + 1)
+        ax.plot(epochs, hist["train"], label="train", color="#1f77b4")
+        ax.plot(epochs, hist["val"], label="val", color="#ff7f0e")
+        be = hist.get("best_epoch", None)
+        if be is not None and be > 0 and be <= len(epochs):
+            ax.axvline(be, color="#2ca02c", linestyle="--", linewidth=1.2, label=f"best@{be}")
+        ax.set_title(title)
+        ax.set_xlabel("epoch")
+        ax.set_ylabel(y_label)
+        ax.grid(True, alpha=0.25)
+        ax.legend()
+
+    out_path = Path(out_dir) / "training_curves_v4.png"
+    fig.savefig(out_path, dpi=150)
+    print(f"[plot] Saved composite curves to: {out_path}")
+
+    # Individual stage plots
+    for idx, (title, y_label, hist) in enumerate(stage_histories, start=1):
+        plt.figure(figsize=(7, 4))
+        epochs = range(1, len(hist["train"]) + 1)
+        plt.plot(epochs, hist["train"], label="train", color="#1f77b4")
+        plt.plot(epochs, hist["val"], label="val", color="#ff7f0e")
+        be = hist.get("best_epoch", None)
+        if be is not None and be > 0 and be <= len(epochs):
+            plt.axvline(be, color="#2ca02c", linestyle="--", linewidth=1.2, label=f"best@{be}")
+        plt.title(title)
+        plt.xlabel("epoch")
+        plt.ylabel(y_label)
+        plt.grid(True, alpha=0.25)
+        plt.legend()
+        stage_path = Path(out_dir) / f"stage{idx}_curve.png"
+        plt.savefig(stage_path, dpi=150)
+        plt.close()
+        print(f"[plot] Saved stage {idx} curve to: {stage_path}")
 
 
 def main():
@@ -333,17 +413,24 @@ def main():
 
     # Stage 1
     print('[stage1] training RGB classifier...')
-    rgb_ckpt = stage1_train_rgb_classifier(cfg, model, train_loader, val_loader, device)
+    rgb_ckpt, stage1_hist = stage1_train_rgb_classifier(cfg, model, train_loader, val_loader, device)
     load_checkpoint(rgb_ckpt, model, device)
 
     # Stage 2
     print('[stage2] training RGBD regressor...')
-    rgbd_ckpt = stage2_train_rgbd_regressor(cfg, model, train_loader, val_loader, device)
+    rgbd_ckpt, stage2_hist = stage2_train_rgbd_regressor(cfg, model, train_loader, val_loader, device)
     load_checkpoint(rgbd_ckpt, model, device)
 
     # Stage 3
     print('[stage3] training fusion model...')
-    best_full = stage3_train_fusion(cfg, model, train_loader, val_loader, device)
+    best_full, stage3_hist = stage3_train_fusion(cfg, model, train_loader, val_loader, device)
+
+    # Plot curves for all stages
+    _plot_histories([
+        ("Stage 1: RGB classifier", "Cross-Entropy", stage1_hist),
+        ("Stage 2: RGBD regressor", "MAE", stage2_hist),
+        ("Stage 3: Fusion (final MAE)", "MAE", stage3_hist),
+    ], cfg.out_dir)
 
     print(f"Done. Best full model saved to: {best_full}")
 
