@@ -1,0 +1,84 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# PyTorch
+*.pth
+*.pt
+*.ckpt
+*.safetensors
+
+# Data
+data/
+datasets/
+*.csv
+*.npy
+*.npz
+*.h5
+*.hdf5
+
+# Images (keep structure but ignore actual images)
+*.png
+*.jpg
+*.jpeg
+*.tif
+*.tiff
+!docs/*.png
+!docs/*.jpg
+
+# Outputs
+output/
+outputs/
+results/
+checkpoints/
+logs/
+runs/
+wandb/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Tensorboard
+events.out.tfevents.*
+
+# Misc
+*.log
+.cache/
+.pytest_cache/
+htmlcov/
+.coverage
+.coverage.*

@@ -7,15 +7,15 @@ from model_v1.augmented_dataloader import AugmentedLettuceDataset
 
 # Config
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-TRAIN_RGB = '../datasets/Training/Augmented/RGBImages'
-TRAIN_DEPTH = '../datasets/Training/Augmented/DepthImages'
-TRAIN_CSV = '../datasets/Training/Augmented/Train_aug.csv'
+TRAIN_RGB = '../datasets/Training/RGBImages'
+TRAIN_DEPTH = '../datasets/Training/DepthImages'
+TRAIN_CSV = '../datasets/Training/Train.csv'
 MODEL_PATH = 'best_model.pth'
 IMAGE_SIZE = 64
 
 def evaluate_on_training():
     print('Loading training dataset...')
-    train_dataset = AugmentedLettuceDataset(
+    train_dataset = LettuceDataset(
         RGB_dir=TRAIN_RGB,
         depth_dir=TRAIN_DEPTH,
         labels_file=TRAIN_CSV,
