@@ -18,7 +18,7 @@ NeuralSprouts/
 
 ## Getting Started
 
-1. Add your dataset to the `datasets/` folder
+1. Add your dataset to the `datasets/` folder (see [datasets/README.md](datasets/README.md) for structure details)
 2. Each model is in its own folder under `models/` with independent training scripts
 3. See individual model README files for specific setup and training instructions
 
@@ -26,31 +26,31 @@ NeuralSprouts/
 
 ### Model Evolution
 
-- **simple_cnn**: Lightweight baseline CNN for quick prototyping and baseline performance
+- **[simple_cnn](models/simple_cnn/README.md)**: Lightweight baseline CNN for quick prototyping and baseline performance
   - Single-task regression (dry weight only)
   - 3 convolutional layers, simple architecture
   
-- **model_v1**: Multi-branch CNN with dual tasks
+- **[model_v1](models/model_v1/README.md)**: Multi-branch CNN with dual tasks
   - RGBD branch for dry weight regression
   - RGB branch for variety classification
   - 6-layer and 5-layer convolutional networks
 
-- **model_v2**: Extended three-branch architecture
+- **[model_v2](models/model_v2/README.md)**: Extended three-branch architecture
   - Adds depth-only branch for leaf area prediction
   - Three separate task objectives
   - Enhanced multi-task learning
 
-- **model_v3**: Transfer learning with ResNet18
+- **[model_v3](models/model_v3/README.md)**: Transfer learning with ResNet18
   - Pretrained ImageNet weights
   - Single-task regression focus
   - Includes Streamlit debugging tools
 
-- **model_v4**: Advanced fusion network
+- **[model_v4](models/model_v4/README.md)**: Advanced fusion network
   - RGB classification + RGBD regression branches
   - Fusion network combines features
   - Three-stage training strategy
 
-- **multimodal_fusion**: State-of-the-art architecture
+- **[multimodal_fusion](models/multimodal_fusion/README.md)**: State-of-the-art architecture
   - ConvNeXt/EfficientNet backbones
   - Semantic segmentation + regression
   - Phenotype feature extraction
