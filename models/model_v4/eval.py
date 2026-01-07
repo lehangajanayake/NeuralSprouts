@@ -35,14 +35,10 @@ def seed_everything(seed: int = 42, deterministic: bool = True):
         torch.backends.cudnn.benchmark = False
         # Be robust: some torch builds don't expose this API, and even when they do,
         # enabling strict determinism may raise depending on platform/backend.
-        uda = getattr(torch, 'use_deterministic_algorithms', None)
-        if callable(uda):
-            try:
-                uda(True)
-            except Exception as e:
-                print(f"[warn] couldn't enable strict deterministic algorithms ({type(e).__name__}: {e}); continuing without it")
-        else:
-            print("[warn] torch.use_deterministic_algorithms not available; continuing without it")
+        try:
+            torch.use_deterministic_algorithms(True, warn_only=True)
+        except Exception:
+            pass
 
 
 def main(cfg: Optional[EvalConfig] = None):

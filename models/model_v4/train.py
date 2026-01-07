@@ -22,9 +22,9 @@ class TrainConfig:
     depth_dir: str = '../../datasets/Training/Augmented/DepthImages'
 
     batch_size: int = 64
-    num_epochs_stage1: int = 30
-    num_epochs_stage2: int = 40
-    num_epochs_stage3: int = 60
+    num_epochs_stage1: int = 100
+    num_epochs_stage2: int = 100
+    num_epochs_stage3: int = 200
 
     lr_stage1: float = 1e-3
     lr_stage2: float = 1e-3
@@ -51,12 +51,7 @@ def seed_everything(seed: int = 42, deterministic: bool = True):
     if deterministic:
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
-        uda = getattr(torch, 'use_deterministic_algorithms', None)
-        if callable(uda):
-            try:
-                uda(True)
-            except Exception as e:
-                print(f"[warn] couldn't enable strict deterministic algorithms ({type(e).__name__}: {e}); continuing without it")
+        torch.use_deterministic_algorithms(True, warn_only=True)
 
 def seed_worker(worker_id: int):
     worker_seed = torch.initial_seed() % 2**32

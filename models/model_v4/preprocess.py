@@ -29,7 +29,7 @@ class PreprocessConfig:
     crop_size: int = 900
 
     # how many augmented variants per original (not counting the original)
-    num_aug_per_image: int = 3
+    num_aug_per_image: int = 20
     seed: int = 42
 
     # Parallelism / speed knobs
