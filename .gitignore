@@ -215,3 +215,8 @@ __marimo__/
 /datasets/Training/Augmented/
 /datasets/Test/Augmented/
 Test_with_predictions.csv
+
+
+#graphs
+
+/models/**/*.png
