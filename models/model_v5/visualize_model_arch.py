@@ -21,8 +21,8 @@ st.caption("Triple-branch fusion: RGB, RGBD, Depth → Fusion FC → Dry weight"
 
 # Sidebar controls
 st.sidebar.header("Model Hyperparameters")
-branch_dim = st.sidebar.slider("branch_dim (features per branch)", 64, 512, 256, step=32)
-fc_hidden = st.sidebar.slider("Fusion hidden size", 64, 512, 256, step=32)
+branch_dim = st.sidebar.slider("branch_dim (features per branch)", 0, 512, 256, step=32)
+fc_hidden = st.sidebar.slider("Fusion hidden size", 0, 512, 256, step=32)
 dropout = st.sidebar.slider("Dropout", 0.0, 0.6, 0.2, step=0.05)
 input_size = st.sidebar.selectbox("Input resolution", [128, 96, 64], index=0)
 device = "cpu"  # keep small and CPU-safe for visualization

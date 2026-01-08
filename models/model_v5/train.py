@@ -40,8 +40,8 @@ class TrainConfig:
     scheduler_gamma: float = 0.1  # step/exponential decay
     
     # Model
-    branch_dim: int = 64
-    fc_hidden: int = 128
+    branch_dim: int = 32
+    fc_hidden: int = 64
     dropout: float = 0.2
     
     # Data
@@ -50,8 +50,8 @@ class TrainConfig:
     device: str = 'cuda'
     
     # Output
-    out_dir: str = './5.6/'
-    log_name: str = 'train_v5.6'
+    out_dir: str = './5.7/'
+    log_name: str = 'train_v5.7'
     save_interval: int = 50  # Save checkpoint every N epochs
     
     # Debug
