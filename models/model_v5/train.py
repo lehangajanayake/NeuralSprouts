@@ -28,7 +28,7 @@ class TrainConfig:
     depth_dir: str = '../../datasets/Training/Augmented/DepthImages'
     
     # Training
-    batch_size: int = 8  # 6GB VRAM, 128x128 images
+    batch_size: int = 32  # 6GB VRAM, 128x128 images
     num_epochs: int = 200
     lr: float = 1e-3  # Adam learning rate
     weight_decay: float = 1e-3
@@ -50,8 +50,8 @@ class TrainConfig:
     device: str = 'cuda'
     
     # Output
-    out_dir: str = './5.7/'
-    log_name: str = 'train_v5.7'
+    out_dir: str = './5.8/'
+    log_name: str = 'train_v5.8'
     save_interval: int = 50  # Save checkpoint every N epochs
     
     # Debug

@@ -1,6 +1,5 @@
 import os
-from pathlib import Path
-from typing import Union, Tuple
+from typing import Tuple, Optional
 
 import numpy as np
 import pandas as pd
@@ -112,6 +111,51 @@ def predict_batch(
     return preds.cpu().numpy()
 
 
+def _infer_dims_from_state(state_dict: dict) -> Tuple[Optional[int], Optional[int]]:
+    """Infer branch_dim and fc_hidden from checkpoint shapes."""
+    branch_dim: Optional[int] = None
+    fc_hidden: Optional[int] = None
+
+    first_fc_key = 'fusion_fc.net.0.weight'
+    if first_fc_key in state_dict:
+        fc_hidden = state_dict[first_fc_key].shape[0]
+        in_features = state_dict[first_fc_key].shape[1]
+        branch_dim = in_features // 3
+
+    if branch_dim is None:
+        for k in (
+            'rgb_branch.head.1.weight',
+            'rgbd_branch.head.1.weight',
+            'depth_branch.head.1.weight',
+        ):
+            if k in state_dict:
+                branch_dim = state_dict[k].shape[0]
+                break
+
+    return branch_dim, fc_hidden
+
+
+def load_model(model_path: str, device: str) -> torch.nn.Module:
+    """Load PlantV5TripleBranch with dims inferred from checkpoint."""
+    state_dict = torch.load(model_path, map_location='cpu')
+    branch_dim, fc_hidden = _infer_dims_from_state(state_dict)
+
+    model = PlantV5TripleBranch(
+        branch_dim=branch_dim or 32,
+        fc_hidden=fc_hidden or 64,
+        dropout=0.2,
+    )
+
+    load_result = model.load_state_dict(state_dict, strict=False)
+    missing, unexpected = load_result.missing_keys, load_result.unexpected_keys
+    if missing:
+        print(f"Missing keys when loading checkpoint: {missing}")
+    if unexpected:
+        print(f"Unexpected keys when loading checkpoint: {unexpected}")
+
+    return model.to(device)
+
+
 def predict_from_files(
     model: torch.nn.Module,
     rgb_dir: str,
@@ -194,12 +238,13 @@ def main(
         device: Device to use
     """
     # Load model
+    actual_device = device if (device == 'cpu' or torch.cuda.is_available()) else 'cpu'
+    if actual_device != device:
+        print("CUDA not available, falling back to CPU")
+
     print(f"Loading model from {model_path}...")
-    model = PlantV5TripleBranch()
-    state_dict = torch.load(model_path, map_location=device)
-    model.load_state_dict(state_dict)
-    model = model.to(device)
-    print("Model loaded successfully")
+    model = load_model(model_path, actual_device)
+    print(f"Model loaded successfully with device={actual_device}")
     
     # Get image IDs
     if input_csv:
@@ -219,7 +264,7 @@ def main(
         rgb_dir,
         depth_dir,
         image_ids,
-        device=device,
+        device=actual_device,
         image_size=image_size,
         do_center_crop=do_center_crop,
         crop_size=crop_size,

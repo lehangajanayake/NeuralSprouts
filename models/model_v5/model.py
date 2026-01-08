@@ -5,7 +5,7 @@ import torch.nn as nn
 class ConvBlock(nn.Module):
     """Standard conv block: Conv2d -> BatchNorm -> ReLU -> MaxPool2d."""
     
-    def __init__(self, in_ch: int, out_ch: int, *, k: int = 3, p: int = 1):
+    def __init__(self, in_ch: int, out_ch: int, *, k: int = 4, p: int = 2):
         super().__init__()
         self.net = nn.Sequential(
             nn.Conv2d(in_ch, out_ch, kernel_size=k, padding=p, bias=False),
