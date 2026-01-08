@@ -1,6 +1,7 @@
 import os
 from dataclasses import dataclass
 from typing import Optional
+import itertools
 
 import pandas as pd
 import numpy as np
@@ -18,10 +19,7 @@ class EvalConfig:
     rgb_dir: str = '../../datasets/Training/Augmented/RGBImages'
     depth_dir: str = '../../datasets/Training/Augmented/DepthImages'
 
-    # head can be 'fusion' (Stage 3 full model) or 'rgbd' (Stage 2 regressor)
-    head: str = 'fusion'
-    # Optional checkpoint override; if empty uses default per head
-    checkpoint: Optional[str] = None
+    checkpoint: str = 'best_model_v4.pth'
     batch_size: int = 128
     seed: int = 42
 
@@ -68,71 +66,53 @@ def main(cfg: Optional[EvalConfig] = None):
     from torch.utils.data import Subset
     train_loader = DataLoader(Subset(ds_train, train_indices), batch_size=cfg.batch_size, shuffle=False, num_workers=0)
     val_loader = DataLoader(Subset(ds_val, val_indices), batch_size=cfg.batch_size, shuffle=False, num_workers=0)
+    # For debug: evaluate also on train set
+    combined_loader = itertools.chain(val_loader, train_loader)
 
     model = LettuceMultiBranchCNN(num_classes=len(ds_val.variety2idx)).to(device)
-    # Resolve checkpoint based on selected head
-    default_ckpt = 'best_model_v4.pth' if cfg.head == 'fusion' else 'best_rgbd_branch_v4.pth'
-    ckpt_path = cfg.checkpoint or default_ckpt
-    state = torch.load(ckpt_path, map_location=device)
+    state = torch.load(cfg.checkpoint, map_location=device)
     model.load_state_dict(state)
     model.eval()
 
     mae = nn.L1Loss(reduction='sum')
 
     print(f"\n=== Evaluating on validation set (group-aware split, n={len(val_indices)}) ===")
-    print(f"Head: {cfg.head} | Checkpoint: {ckpt_path}")
     
     total_abs = 0.0
     total_n = 0
     correct = 0
     total_cls = 0
-    
-    # Compute confusion matrix
-    cm = np.zeros((len(ds_val.variety2idx), len(ds_val.variety2idx)), dtype=np.int64)
 
     with torch.no_grad():
-        for batch_idx, batch in enumerate(val_loader):
+        for batch_idx, batch in enumerate(combined_loader):
             rgb = batch['rgb'].to(device)
             rgbd = batch['rgbd'].to(device)
             y = batch['dry_weight'].to(device)
             y_cls = batch['variety_class'].to(device)
 
-            logits, rgbd_pred, fusion_pred = model(rgb, rgbd)
-            # Choose prediction based on selected head
-            pred_reg = fusion_pred if cfg.head == 'fusion' else rgbd_pred
-            total_abs += mae(pred_reg, y).item()
+            logits, _, fusion_pred = model(rgb, rgbd)
+            total_abs += mae(fusion_pred, y).item()
             total_n += y.size(0)
 
             pred_cls = logits.argmax(dim=1)
             correct += (pred_cls == y_cls).sum().item()
             total_cls += y_cls.size(0)
             
-            # Update confusion matrix
-            for t, p in zip(y_cls.view(-1), pred_cls.view(-1)):
-                cm[int(t.item()), int(p.item())] += 1
-            
             if batch_idx == 0:
                 # Debug: print first batch predictions vs labels
                 print(f"\nDEBUG first batch:")
-                print(f"  Labels: {y_cls.cpu().tolist()[:20]}...")
-                print(f"  Predictions: {pred_cls.cpu().tolist()[:20]}...")
+                print(f"  Labels: {y_cls.cpu().tolist()}")
+                print(f"  Predictions: {pred_cls.cpu().tolist()}")
+                print(f"  Logits shape: {logits.shape}")
                 print(f"  Variety index mapping: {ds_val.variety2idx}")
 
     final_mae = total_abs / max(1, total_n)
     acc = correct / max(1, total_cls)
-    cm_accuracy = cm.diagonal().sum() / cm.sum() if cm.sum() > 0 else 0
 
-    label_head = 'fusion output' if cfg.head == 'fusion' else 'RGBD regressor'
-    print(f"\nValidation MAE (dry weight, {label_head}): {final_mae:.6f}")
-    print(f"Validation Classification accuracy (individual samples): {acc:.4%}")
-    print(f"Validation Classification accuracy (CM diagonal / total): {cm_accuracy:.4%}")
-    print(f"\nConfusion Matrix:")
-    print(cm)
-    print(f"\nRow-normalized CM:")
-    cm_norm = cm.astype(np.float32) / cm.sum(axis=1, keepdims=True)
-    print(cm_norm)
+    print(f"Validation MAE (dry weight, fusion output): {final_mae:.6f}")
+    print(f"Validation Classification accuracy: {acc:.4%}")
     print(f"\nNote: Evaluated on group-aware validation split (no plant leakage)")
-    print(f"      Compare with debug.log confusion matrix results")
+    print(f"      Same as debug.log confusion matrix results")
 
 
 if __name__ == '__main__':

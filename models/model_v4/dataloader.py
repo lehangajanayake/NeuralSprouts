@@ -1,5 +1,5 @@
 import os
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional, Tuple, List
 
 import numpy as np
 import pandas as pd
@@ -13,7 +13,48 @@ except Exception:  # pragma: no cover
     T = None
 
 
-def _center_crop_900(img: Image.Image) -> Image.Image:
+def group_aware_train_val_split(
+    df: pd.DataFrame,
+    val_ratio: float = 0.2,
+    seed: int = 42,
+) -> Tuple[List[int], List[int]]:
+    """Group-aware split: all variants of an original plant stay in same split.
+    
+    Groups by 'orig_id' if available; otherwise falls back to row-wise split.
+    Returns train_indices, val_indices.
+    """
+    if 'orig_id' not in df.columns:
+        # Fallback: row-wise split (old behavior)
+        n = len(df)
+        indices = np.arange(n)
+        np.random.RandomState(seed).shuffle(indices)
+        split_point = int(n * (1 - val_ratio))
+        return indices[:split_point].tolist(), indices[split_point:].tolist()
+    
+    # Group by orig_id
+    orig_groups = df.groupby('orig_id').groups
+    orig_ids = sorted(orig_groups.keys())
+    
+    # Split orig_ids
+    n_orig = len(orig_ids)
+    n_val_orig = max(1, int(n_orig * val_ratio))
+    
+    rng = np.random.RandomState(seed)
+    shuffled = rng.permutation(orig_ids)
+    val_orig_ids = set(shuffled[:n_val_orig])
+    
+    train_indices = []
+    val_indices = []
+    for orig_id, group_indices in orig_groups.items():
+        if orig_id in val_orig_ids:
+            val_indices.extend(group_indices.tolist())
+        else:
+            train_indices.extend(group_indices.tolist())
+    
+    return train_indices, val_indices
+
+
+
     w, h = img.size
     if w < 900 or h < 900:
         # fallback: crop to min side to avoid negative coords
@@ -49,7 +90,7 @@ class PlantDatasetV4(Dataset):
         labels_csv: str,
         *,
         image_size: int = 64,
-        augment: bool = False,
+        augment: bool = False,  # Deprecated: static variants from preprocess.py are sufficient
         seed: int = 42,
         enable_cache: bool = False,
         num_views: int = 1,
@@ -117,29 +158,8 @@ class PlantDatasetV4(Dataset):
         return int(global_idx), 0
 
     def _maybe_aug(self, rgb: Image.Image, depth: Image.Image, base_idx: int, view_idx: int) -> Tuple[Image.Image, Image.Image]:
-        if not self.augment or T is None:
-            return rgb, depth
-
-        # deterministic per (base_idx, view_idx)
-        rng = np.random.RandomState(self.seed + int(base_idx) * 9973 + int(view_idx) * 101)
-
-        # flips
-        if rng.rand() < 0.5:
-            rgb = T.functional.hflip(rgb)
-            depth = T.functional.hflip(depth)
-        if rng.rand() < 0.5:
-            rgb = T.functional.vflip(rgb)
-            depth = T.functional.vflip(depth)
-
-        # rotation multiples of 90 keeps it stable and avoids introducing depth artifacts
-        k = int(rng.randint(0, 4))
-        if k:
-            angle = 90 * k
-            rgb = T.functional.rotate(rgb, angle)
-            depth = T.functional.rotate(depth, angle)
-
-        # rgb-only photometric aug
-        rgb = self.color_jitter(rgb)
+        # Runtime augmentation is deprecated; static augmented variants from preprocess.py are sufficient.
+        # Keep this method for backward compatibility but it's a no-op.
         return rgb, depth
 
     def __getitem__(self, idx: int):
@@ -157,8 +177,8 @@ class PlantDatasetV4(Dataset):
         rgb = Image.open(rgb_path).convert('RGB')
         depth = Image.open(depth_path).convert('L')
 
-        rgb = _center_crop_900(rgb)
-        depth = _center_crop_900(depth)
+        # Note: augmented dataset is already cropped (900x900) and resized (64x64) by preprocess.py
+        # No additional cropping needed here.
 
         rgb, depth = self._maybe_aug(rgb, depth, base_idx, view_idx)
 
@@ -256,6 +276,18 @@ class TestPlantDatasetV4(Dataset):
         else:
             self.resize = T.Resize((self.image_size, self.image_size))
 
+    def _center_crop_900(self, img: Image.Image) -> Image.Image:
+        w, h = img.size
+        if w < 900 or h < 900:
+            side = min(w, h)
+            left = (w - side) / 2
+            top = (h - side) / 2
+            return img.crop((left, top, left + side, top + side))
+
+        left = (w - 900) / 2
+        top = (h - 900) / 2
+        return img.crop((left, top, left + 900, top + 900))
+
     def __len__(self) -> int:
         return len(self.df)
 
@@ -266,8 +298,9 @@ class TestPlantDatasetV4(Dataset):
         rgb = Image.open(row['rgb_path']).convert('RGB')
         depth = Image.open(row['depth_path']).convert('L')
 
-        rgb = _center_crop_900(rgb)
-        depth = _center_crop_900(depth)
+        # Note: test dataset may not be preprocessed; apply crop for safety if raw images
+        rgb = self._center_crop_900(rgb)
+        depth = self._center_crop_900(depth)
 
         if self.resize is not None:
             rgb = self.resize(rgb)

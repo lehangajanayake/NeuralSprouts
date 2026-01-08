@@ -67,7 +67,7 @@ class RGBDRegressionBranch(nn.Module):
 class FusionMLP(nn.Module):
     """(4 logits + 1 reg) -> final dry weight."""
 
-    def __init__(self, in_dim: int = 5, hidden: int = 64, dropout: float = 0.3):
+    def __init__(self, in_dim: int = 5, hidden: int = 64, dropout: float = 0.5):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(in_dim, hidden),

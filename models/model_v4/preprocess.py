@@ -128,6 +128,7 @@ def _process_one_row(args) -> List[Dict]:
     depth.save(os.path.join(cfg.out_depth_dir, f'Depth_{base_out_id}.png'))
     r0 = dict(row_dict)
     r0['id'] = base_out_id
+    r0['orig_id'] = orig_id  # Track the original plant ID
     out_rows.append(r0)
 
     # augmented variants
@@ -142,6 +143,7 @@ def _process_one_row(args) -> List[Dict]:
         depth_aug.save(os.path.join(cfg.out_depth_dir, f'Depth_{out_id}.png'))
 
         rk = dict(row_dict)
+        rk['orig_id'] = orig_id  # Track the original plant ID
         rk['id'] = out_id
         out_rows.append(rk)
 
