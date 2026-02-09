@@ -30,6 +30,7 @@ class PreprocessConfig:
 
     # how many augmented variants per original (not counting the original)
     num_aug_per_image: int = 30
+    max_center_shift: int = 100  # max pixel shift for random pre-crop translations
     seed: int = 42
 
     # Parallelism / speed knobs
@@ -54,6 +55,31 @@ def center_crop(img: Image.Image, crop_size: int) -> Image.Image:
     left = (w - crop_size) / 2
     top = (h - crop_size) / 2
     return img.crop((left, top, left + crop_size, top + crop_size))
+
+
+def shifted_center_crop(img: Image.Image, crop_size: int, shift: Tuple[int, int]) -> Image.Image:
+    w, h = img.size
+    if w < crop_size or h < crop_size:
+        return center_crop(img, crop_size)
+
+    dx, dy = shift
+    left = (w - crop_size) / 2 + dx
+    top = (h - crop_size) / 2 + dy
+    left = min(max(0, left), max(0, w - crop_size))
+    top = min(max(0, top), max(0, h - crop_size))
+    return img.crop((left, top, left + crop_size, top + crop_size))
+
+
+def random_center_shift(rng: np.random.RandomState, max_shift: int) -> Tuple[int, int]:
+    if max_shift <= 0:
+        return 0, 0
+    pixels = int(rng.randint(0, max_shift + 1))
+    if pixels == 0:
+        return 0, 0
+    angle = rng.uniform(0.0, 2.0 * math.pi)
+    dx = int(round(pixels * math.cos(angle)))
+    dy = int(round(pixels * math.sin(angle)))
+    return dx, dy
 
 
 def apply_aug(rgb: Image.Image, depth: Image.Image, rng: np.random.RandomState) -> Tuple[Image.Image, Image.Image]:
@@ -83,9 +109,18 @@ def apply_aug(rgb: Image.Image, depth: Image.Image, rng: np.random.RandomState) 
     return rgb, depth
 
 
-def preprocess_one(rgb: Image.Image, depth: Image.Image, cfg: PreprocessConfig) -> Tuple[Image.Image, Image.Image]:
-    rgb = center_crop(rgb, cfg.crop_size)
-    depth = center_crop(depth, cfg.crop_size)
+def preprocess_one(
+    rgb: Image.Image,
+    depth: Image.Image,
+    cfg: PreprocessConfig,
+    shift: Optional[Tuple[int, int]] = None,
+) -> Tuple[Image.Image, Image.Image]:
+    if shift is not None and shift != (0, 0):
+        rgb = shifted_center_crop(rgb, cfg.crop_size, shift)
+        depth = shifted_center_crop(depth, cfg.crop_size, shift)
+    else:
+        rgb = center_crop(rgb, cfg.crop_size)
+        depth = center_crop(depth, cfg.crop_size)
 
     rgb = rgb.resize((cfg.image_size, cfg.image_size), resample=Image.BILINEAR)
     depth = depth.resize((cfg.image_size, cfg.image_size), resample=Image.BILINEAR)
@@ -138,7 +173,8 @@ def _process_one_row(args) -> List[Dict]:
 
         rng = np.random.RandomState(int(cfg.seed) + orig_id * 100 + k)
         rgb_aug, depth_aug = apply_aug(rgb0, depth0, rng)
-        rgb_aug, depth_aug = preprocess_one(rgb_aug, depth_aug, cfg)
+        shift = random_center_shift(rng, int(cfg.max_center_shift))
+        rgb_aug, depth_aug = preprocess_one(rgb_aug, depth_aug, cfg, shift=shift)
 
         rgb_aug.save(os.path.join(cfg.out_rgb_dir, f'RGB_{out_id}.png'))
         depth_aug.save(os.path.join(cfg.out_depth_dir, f'Depth_{out_id}.png'))
@@ -188,6 +224,7 @@ def main(cfg: Optional[PreprocessConfig] = None) -> None:
         'image_size': cfg.image_size,
         'crop_size': cfg.crop_size,
         'num_aug_per_image': cfg.num_aug_per_image,
+        'max_center_shift': cfg.max_center_shift,
         'seed': cfg.seed,
         'num_workers': cfg.num_workers,
         'max_items': cfg.max_items,
