@@ -1,0 +1,21 @@
+okay for model v4 i want a CNN with the use of torch conv2d with multiple layers
+
+
+first branch would be RGB which would try to predcit the type of lettuce,
+second would be a RGBD branch thats trying to predict the dry weight of the lettuce
+
+there will be a fusion layer that will connect the 4 outputs of the first banch and the 1 output of second branch
+so the in channels would be 5 and the out would be 1, this can have multiple layers.
+
+what makes this model different is the fact that this will train the different branches in stages.
+first stage will be to freeze all other branches and the fusion layer and train the first branch using a appropiate learning loop until loss hits a platoe,
+then it will freeze the first branch, and fusion. then unfreeze second branch and start training the second branch with a seprate dedicated training loop.
+when the loss of the second branch hits a platoe, u will free both branches and unfreeze the fusion and start training the fusion so that it would use both branches data to make better predictions
+
+
+i  want to preprocessing.py wich will create a datasets\Training\Augmented if it doenst exsists and takes the training dataset and crop it 64x64 and apply multiple random augmentations take inspiration form the model_v2 preprocessing since ill be re-using previeoslhy augmentsed dataset.
+
+the training dataset is in datasets\Training\Augmented with Train_aug.csv with the ground truth
+
+then also make a evaluate model script that will crop the images to the disred 64x64 size and evaluvatge the model on the pictures in datasets\Training
+ and ground truth is datasets\Training\Train.csv
