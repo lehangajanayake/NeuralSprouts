@@ -48,6 +48,18 @@ class Trainer:
         
         self.logger.info(f"Trainer initialized on device: {self.device}")
     
+    @staticmethod
+    def _shutdown_loader(loader: DataLoader):
+        """Attempt to shut down dataloader workers cleanly."""
+        try:
+            iterator = getattr(loader, '_iterator', None)
+            if iterator is not None:
+                shutdown = getattr(iterator, '_shutdown_workers', None)
+                if callable(shutdown):
+                    shutdown()
+        except Exception:
+            pass
+    
     def setup_logging(self):
         """Setup logging."""
         log_file = self.experiment_dir / "training.log"
@@ -232,6 +244,7 @@ class Trainer:
             batch_size=self.config.BATCH_SIZE,
             shuffle=shuffle,
             num_workers=self.config.NUM_WORKERS,
+            persistent_workers=self.config.PERSISTENT_WORKERS,
             include_target=include_target
         )
     
@@ -254,28 +267,35 @@ class Trainer:
         with open(config_path, 'w') as f:
             json.dump(self.config.to_dict(), f, indent=4)
         
-        for epoch in range(self.config.EPOCHS):
-            self.logger.info(f"\n=== Epoch {epoch + 1}/{self.config.EPOCHS} ===")
-            
-            # Train
-            train_loss = self.train_epoch(train_loader)
-            self.train_losses.append(train_loss)
-            self.logger.info(f"Train Loss: {train_loss:.4f}")
-            
-            # Validate
-            if val_loader is not None:
-                val_loss, predictions, ground_truth, image_ids = self.validate(val_loader)
-                self.val_losses.append(val_loss)
-                self.logger.info(f"Val Loss: {val_loss:.4f}")
+        try:
+            for epoch in range(self.config.EPOCHS):
+                self.logger.info(f"\n=== Epoch {epoch + 1}/{self.config.EPOCHS} ===")
                 
-                # Save best model
-                if val_loss < self.best_val_loss:
-                    self.best_val_loss = val_loss
-                    self.best_epoch = epoch
-                    self.save_checkpoint(epoch, is_best=True)
-                    self.logger.info(f"Best model updated! (Loss: {val_loss:.4f})")
-            else:
-                self.save_checkpoint(epoch)
+                # Train
+                train_loss = self.train_epoch(train_loader)
+                self.train_losses.append(train_loss)
+                self.logger.info(f"Train Loss: {train_loss:.4f}")
+                
+                # Validate
+                if val_loader is not None:
+                    val_loss, predictions, ground_truth, image_ids = self.validate(val_loader)
+                    self.val_losses.append(val_loss)
+                    self.logger.info(f"Val Loss: {val_loss:.4f}")
+                    
+                    # Save best model
+                    if val_loss < self.best_val_loss:
+                        self.best_val_loss = val_loss
+                        self.best_epoch = epoch
+                        self.save_checkpoint(epoch, is_best=True)
+                        self.logger.info(f"Best model updated! (Loss: {val_loss:.4f})")
+                else:
+                    self.save_checkpoint(epoch)
+        except KeyboardInterrupt:
+            self.logger.info("Training interrupted by user. Cleaning up dataloaders...")
+            self._shutdown_loader(train_loader)
+            if val_loader is not None:
+                self._shutdown_loader(val_loader)
+            raise
         
         # Save training history
         history = {

@@ -70,7 +70,11 @@ class Config:
     DEVICE = "cuda"
     
     # Number of workers for dataloader
-    NUM_WORKERS = 4
+    NUM_WORKERS = 16
+    PERSISTENT_WORKERS = True
+
+    # Dataset caching (store tensors in memory after first load)
+    ENABLE_DATASET_CACHE = True
 
     # Validation split parameters
     VAL_SPLIT_RATIO = 0.2

@@ -76,7 +76,8 @@ class RGBDepthDataset(Dataset):
                  target_col: str = "DryWeightShoot",
                  include_target: bool = True,
                  crop_size: Optional[int] = None,
-                 resize_size: Optional[int] = None):
+                 resize_size: Optional[int] = None,
+                 enable_cache: Optional[bool] = None):
         self.data = pd.read_csv(csv_file)
         self.data.columns = [col.strip() for col in self.data.columns]
         self.rgb_dir = Path(rgb_dir)
@@ -94,9 +95,11 @@ class RGBDepthDataset(Dataset):
 
         self.crop_size = crop_size if crop_size is not None else Config.CENTER_CROP_SIZE
         self.resize_size = resize_size if resize_size is not None else Config.RESIZE_SIZE
+        self.enable_cache = Config.ENABLE_DATASET_CACHE if enable_cache is None else enable_cache
 
         self.data[self.image_id_col] = self.data[self.image_id_col].astype(str)
         self._path_cache: Dict[str, Tuple[Path, Path]] = {}
+        self._tensor_cache: Dict[str, Tuple[torch.Tensor, torch.Tensor]] = {}
         self._filter_available_rows()
 
     def _filter_available_rows(self) -> None:
@@ -142,17 +145,23 @@ class RGBDepthDataset(Dataset):
         if rgb_path is None or depth_path is None:
             raise FileNotFoundError(f"Missing RGB/Depth files for image id {image_id}")
 
-        rgb_np, depth_np = _load_rgb_depth(
-            rgb_path,
-            depth_path,
-            crop_size=self.crop_size,
-            resize_size=self.resize_size
-        )
-        depth_np = np.expand_dims(depth_np, axis=-1)
-        rgbd_np = np.concatenate([rgb_np, depth_np], axis=-1)
+        if self.enable_cache and image_id in self._tensor_cache:
+            rgb_tensor, rgbd_tensor = self._tensor_cache[image_id]
+        else:
+            rgb_np, depth_np = _load_rgb_depth(
+                rgb_path,
+                depth_path,
+                crop_size=self.crop_size,
+                resize_size=self.resize_size
+            )
+            depth_np = np.expand_dims(depth_np, axis=-1)
+            rgbd_np = np.concatenate([rgb_np, depth_np], axis=-1)
 
-        rgb_tensor = torch.from_numpy(rgb_np).permute(2, 0, 1).float() / 255.0
-        rgbd_tensor = torch.from_numpy(rgbd_np).permute(2, 0, 1).float() / 255.0
+            rgb_tensor = torch.from_numpy(rgb_np).permute(2, 0, 1).float() / 255.0
+            rgbd_tensor = torch.from_numpy(rgbd_np).permute(2, 0, 1).float() / 255.0
+
+            if self.enable_cache:
+                self._tensor_cache[image_id] = (rgb_tensor, rgbd_tensor)
 
         if self.include_target and self.target_col is not None:
             target_value = float(row[self.target_col])
@@ -169,21 +178,27 @@ def create_dataloader(csv_file: str,
                       batch_size: int = 32,
                       shuffle: bool = True,
                       num_workers: int = 4,
+                      persistent_workers: Optional[bool] = None,
                       include_target: bool = True,
                       crop_size: Optional[int] = None,
-                      resize_size: Optional[int] = None) -> DataLoader:
+                      resize_size: Optional[int] = None,
+                      enable_cache: Optional[bool] = None) -> DataLoader:
     dataset = RGBDepthDataset(
         csv_file=csv_file,
         rgb_dir=rgb_dir,
         depth_dir=depth_dir,
         include_target=include_target,
         crop_size=crop_size,
-        resize_size=resize_size
+        resize_size=resize_size,
+        enable_cache=enable_cache
     )
+    if persistent_workers is None:
+        persistent_workers = Config.PERSISTENT_WORKERS if num_workers > 0 else False
     return DataLoader(
         dataset,
         batch_size=batch_size,
         shuffle=shuffle,
         num_workers=num_workers,
+        persistent_workers=persistent_workers,
         pin_memory=True
     )

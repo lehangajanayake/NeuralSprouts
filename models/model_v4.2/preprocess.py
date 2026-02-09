@@ -29,7 +29,7 @@ class PreprocessConfig:
     crop_size: int = 1000
 
     # how many augmented variants per original (not counting the original)
-    num_aug_per_image: int = 20
+    num_aug_per_image: int = 30
     seed: int = 42
 
     # Parallelism / speed knobs
@@ -70,10 +70,12 @@ def apply_aug(rgb: Image.Image, depth: Image.Image, rng: np.random.RandomState) 
         rgb = T.functional.vflip(rgb)
         depth = T.functional.vflip(depth)
 
-    # rotation (90's factor keeps depth realistic)
-    angle = rng.choice([0, 90, 180, 270])
-    rgb = T.functional.rotate(rgb, angle)
-    depth = T.functional.rotate(depth, angle)
+    # rotation (0/90/180/270) keeps depth realistic
+    k = int(rng.randint(0, 4))
+    if k:
+        angle = 90 * k
+        rgb = T.functional.rotate(rgb, angle)
+        depth = T.functional.rotate(depth, angle)
 
     # RGB-only color jitter
     cj = T.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.02)
@@ -102,7 +104,9 @@ def _process_one_row(args) -> List[Dict]:
     row_index, row_dict, cfg_dict = args
     cfg = PreprocessConfig(**cfg_dict)
 
+    row_dict = dict(row_dict)
     orig_id = int(row_dict['id'])
+    row_dict['original_id'] = orig_id
     rgb_path = os.path.join(cfg.train_rgb_dir, f'RGB_{orig_id}.png')
     depth_path = os.path.join(cfg.train_depth_dir, f'Depth_{orig_id}.png')
     if not os.path.exists(rgb_path) or not os.path.exists(depth_path):

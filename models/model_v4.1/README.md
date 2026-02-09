@@ -100,4 +100,5 @@ Refer to in-script help (`-h`) for keyboard shortcuts, augmentation preview togg
 - `docs/`, `tests/`, and the viewer remain for archival reference; update them as needed if you rely on those assets.
 
 
-version 4.1.1 MAE (dry weight): 0.155983
+version 4.1.1 MAE (dry weight): 0.155983 20 aug with 90's factor rotation 
+version 4.1.2 MAE (dry weight): 0.100910 30 aug random rot 
