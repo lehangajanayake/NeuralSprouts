@@ -2,13 +2,13 @@ import os
 import random
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Sequence, Tuple
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader, Subset
+from torch.utils.data import DataLoader, Dataset, Subset
 
 from dataloader import PlantDatasetV4
 from model import LettuceMultiBranchCNN
@@ -25,16 +25,23 @@ class TrainConfig:
     rgb_dir: str = '../../datasets/Training/Augmented/RGBImages'
     depth_dir: str = '../../datasets/Training/Augmented/DepthImages'
 
-    batch_size: int = 64
+    batch_size: int = 64  
     num_epochs: int = 200
     lr: float = 1e-3    
     weight_decay: float = 1e-4
+    scheduler_factor: float = 0.5
+    scheduler_patience: int = 10
+    scheduler_min_lr: float = 1e-6
 
-    val_ratio: float = 0.2
+    val_ratio: float = 0.4
     seed: int = 42
     patience: int = 50
     # Matches 1 + num_aug_per_image from preprocess.py
     outputs_per_original: int = 31
+    num_folds: int = 3
+
+    preload_to_gpu: bool = False
+    preload_device: str = 'cuda'
 
     out_dir: str = '.'
 
@@ -57,8 +64,57 @@ def seed_worker(worker_id: int):
     random.seed(worker_seed)
 
 
-def make_loaders(cfg: TrainConfig) -> Tuple[DataLoader, DataLoader]:
-    full = PlantDatasetV4(
+class TensorDictDataset(Dataset):
+    """Simple dataset wrapper around preloaded tensors on any device."""
+
+    def __init__(self, rgb: torch.Tensor, rgbd: torch.Tensor, dry_weight: torch.Tensor):
+        self.rgb = rgb
+        self.rgbd = rgbd
+        self.dry_weight = dry_weight
+
+    def __len__(self) -> int:
+        return self.rgb.size(0)
+
+    def __getitem__(self, idx: int):
+        return {
+            'rgb': self.rgb[idx],
+            'rgbd': self.rgbd[idx],
+            'dry_weight': self.dry_weight[idx],
+        }
+
+
+def _unwrap_subset(dataset):
+    if isinstance(dataset, Subset):
+        return dataset.dataset, dataset.indices
+    return dataset, range(len(dataset))
+
+
+def preload_subset_to_device(dataset, device: torch.device, label: str) -> TensorDictDataset:
+    base_ds, indices = _unwrap_subset(dataset)
+
+    rgb_list: List[torch.Tensor] = []
+    rgbd_list: List[torch.Tensor] = []
+    target_list: List[torch.Tensor] = []
+
+    for idx in indices:
+        sample = base_ds[int(idx)]
+        rgb_list.append(sample['rgb'])
+        rgbd_list.append(sample['rgbd'])
+        target_list.append(sample['dry_weight'])
+
+    if not rgb_list:
+        raise ValueError(f'Cannot preload empty {label} dataset.')
+
+    rgb = torch.stack(rgb_list, dim=0).to(device, non_blocking=True)
+    rgbd = torch.stack(rgbd_list, dim=0).to(device, non_blocking=True)
+    targets = torch.stack(target_list, dim=0).to(device, non_blocking=True)
+
+    print(f"[preload] moved {rgb.shape[0]} {label} samples to {device}")
+    return TensorDictDataset(rgb, rgbd, targets)
+
+
+def _build_full_dataset(cfg: TrainConfig) -> PlantDatasetV4:
+    dataset = PlantDatasetV4(
         cfg.rgb_dir,
         cfg.depth_dir,
         cfg.train_csv,
@@ -67,45 +123,95 @@ def make_loaders(cfg: TrainConfig) -> Tuple[DataLoader, DataLoader]:
         enable_cache=True,
         num_views=1,
     )
-
-    if len(full.df) == 0:
+    if len(dataset.df) == 0:
         raise ValueError('No samples found in augmented CSV; check preprocessing paths.')
+    return dataset
 
-    has_original_ids = 'original_id' in full.df.columns
+
+def _compute_group_ids(full_df, cfg: TrainConfig) -> Tuple[np.ndarray, bool]:
+    has_original_ids = 'original_id' in full_df.columns
     if has_original_ids:
-        group_ids = full.df['original_id'].astype(int).to_numpy()
+        group_ids = full_df['original_id'].astype(int).to_numpy()
     else:
         outputs_per_original = max(1, int(cfg.outputs_per_original))
-        group_ids = ((full.df['id'].astype(int) - 1) // outputs_per_original).to_numpy()
+        group_ids = ((full_df['id'].astype(int) - 1) // outputs_per_original).to_numpy()
+    return group_ids, has_original_ids
+
+
+def _split_group_indices(
+    group_ids: np.ndarray,
+    cfg: TrainConfig,
+    has_original_ids: bool,
+) -> List[Tuple[List[int], List[int]]]:
     unique_groups = np.unique(group_ids)
     total_groups = len(unique_groups)
     if total_groups < 2:
-        raise ValueError('Need at least two unique originals to create a train/val split. Reduce val_ratio or add more data.')
+        raise ValueError('Need at least two unique originals to create a split. Reduce folds or gather more data.')
 
     rng = np.random.RandomState(cfg.seed)
     rng.shuffle(unique_groups)
 
-    val_group_count = max(1, int(round(total_groups * float(cfg.val_ratio))))
-    if val_group_count >= total_groups:
-        val_group_count = total_groups - 1
-    val_group_ids = set(unique_groups[:val_group_count])
+    num_folds = max(1, int(cfg.num_folds))
+    if num_folds > total_groups:
+        print(f"[kfold] Requested {num_folds} folds but only {total_groups} unique originals; capping folds at {total_groups}.")
+        num_folds = total_groups
 
-    base_indices = np.arange(len(full.df))
-    train_indices = [int(i) for i, g in zip(base_indices, group_ids) if g not in val_group_ids]
-    val_indices = [int(i) for i, g in zip(base_indices, group_ids) if g in val_group_ids]
+    splits: List[Tuple[List[int], List[int]]] = []
+    if num_folds > 1:
+        fold_groups = np.array_split(unique_groups, num_folds)
+        for fold_id, val_groups in enumerate(fold_groups, 1):
+            val_set = set(int(g) for g in val_groups)
+            train_idx = [int(i) for i, g in enumerate(group_ids) if g not in val_set]
+            val_idx = [int(i) for i, g in enumerate(group_ids) if g in val_set]
+            if not train_idx or not val_idx:
+                raise ValueError(f'Fold {fold_id} is empty. Reduce num_folds or ensure more originals are available.')
+            splits.append((train_idx, val_idx))
+    else:
+        val_group_count = max(1, int(round(total_groups * float(cfg.val_ratio))))
+        if val_group_count >= total_groups:
+            val_group_count = total_groups - 1
+        if val_group_count < 1:
+            raise ValueError('Validation split is empty. Increase val_ratio or collect more data.')
+        val_group_ids = set(unique_groups[:val_group_count])
+        train_idx = [int(i) for i, g in enumerate(group_ids) if g not in val_group_ids]
+        val_idx = [int(i) for i, g in enumerate(group_ids) if g in val_group_ids]
+        if not train_idx or not val_idx:
+            hint = 'Ensure original_id exists in the CSV' if has_original_ids else 'Adjust val_ratio or outputs_per_original'
+            raise ValueError(f'Group-based split resulted in empty train/val set. {hint}.')
+        splits.append((train_idx, val_idx))
 
-    if not train_indices or not val_indices:
-        hint = 'Ensure original_id exists in the CSV' if has_original_ids else 'Adjust val_ratio or outputs_per_original'
-        raise ValueError(f'Group-based split resulted in empty train/val set. {hint}.')
+    return splits
 
-    train_ds = Subset(full, train_indices)
-    val_ds = Subset(full, val_indices)
 
-    num_workers = 0 if os.name == 'nt' else 2
-    pin_memory = torch.cuda.is_available()
+def _build_dataloaders_from_indices(
+    full_ds: PlantDatasetV4,
+    train_idx: Sequence[int],
+    val_idx: Sequence[int],
+    cfg: TrainConfig,
+    label: str,
+) -> Tuple[DataLoader, DataLoader]:
+    train_ds: Dataset = Subset(full_ds, list(train_idx))
+    val_ds: Dataset = Subset(full_ds, list(val_idx))
+
+    preload_device = None
+    if cfg.preload_to_gpu:
+        try:
+            requested_device = torch.device(cfg.preload_device)
+        except Exception as exc:
+            print(f"[preload] invalid device '{cfg.preload_device}': {exc}. Falling back to CPU.")
+            requested_device = None
+
+        if requested_device is not None:
+            if requested_device.type == 'cuda' and not torch.cuda.is_available():
+                print('[preload] CUDA not available; skipping GPU preload.')
+            else:
+                preload_device = requested_device
+                train_ds = preload_subset_to_device(train_ds, preload_device, f'{label}-train')
+                val_ds = preload_subset_to_device(val_ds, preload_device, f'{label}-val')
+
+    num_workers = 0 if (os.name == 'nt' or preload_device is not None) else 2
+    pin_memory = torch.cuda.is_available() and preload_device is None
     g = torch.Generator().manual_seed(cfg.seed)
-
-    full.build_cache(max_base_items=None)
 
     loader_kwargs = {}
     if num_workers > 0:
@@ -136,6 +242,23 @@ def make_loaders(cfg: TrainConfig) -> Tuple[DataLoader, DataLoader]:
     return train_loader, val_loader
 
 
+def make_fold_loaders(cfg: TrainConfig) -> List[Tuple[DataLoader, DataLoader, str]]:
+    full = _build_full_dataset(cfg)
+    group_ids, has_original_ids = _compute_group_ids(full.df, cfg)
+    splits = _split_group_indices(group_ids, cfg, has_original_ids)
+
+    full.build_cache(max_base_items=None)
+
+    loaders: List[Tuple[DataLoader, DataLoader, str]] = []
+    multiple = len(splits) > 1
+    for fold_idx, (train_idx, val_idx) in enumerate(splits, 1):
+        label = f'fold{fold_idx}' if multiple else 'split'
+        train_loader, val_loader = _build_dataloaders_from_indices(full, train_idx, val_idx, cfg, label)
+        loaders.append((train_loader, val_loader, label))
+
+    return loaders
+
+
 class EarlyStopper:
     def __init__(self, patience: int):
         self.patience = int(patience)
@@ -155,7 +278,7 @@ def save_checkpoint(path: str, model: nn.Module):
     torch.save(model.state_dict(), path)
 
 
-def save_training_curves(train_history: List[float], val_history: List[float], out_dir: str) -> None:
+def save_training_curves(train_history: List[float], val_history: List[float], out_dir: str, suffix: str = '') -> None:
     if not train_history or not val_history:
         return
     if plt is None:
@@ -172,18 +295,35 @@ def save_training_curves(train_history: List[float], val_history: List[float], o
     ax.grid(True, linestyle='--', linewidth=0.5, alpha=0.6)
     ax.legend()
 
-    out_path = Path(out_dir) / 'training_curves.png'
+    out_name = f'training_curves{suffix}.png' if suffix else 'training_curves.png'
+    out_path = Path(out_dir) / out_name
     fig.savefig(out_path, dpi=150, bbox_inches='tight')
     plt.close(fig)
     print(f'Saved training curves to: {out_path}')
 
 
-def train_fusion_regressor(cfg: TrainConfig, model: LettuceMultiBranchCNN, train_loader, val_loader, device):
+def train_fusion_regressor(
+    cfg: TrainConfig,
+    model: LettuceMultiBranchCNN,
+    train_loader,
+    val_loader,
+    device,
+    fold_suffix: str = '',
+    fold_label: str = '',
+):
     criterion = nn.L1Loss()
     optimizer = optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        mode='min',
+        factor=cfg.scheduler_factor,
+        patience=cfg.scheduler_patience,
+        min_lr=cfg.scheduler_min_lr,
+    )
     stopper = EarlyStopper(cfg.patience)
 
-    best_path = str(Path(cfg.out_dir) / 'best_model_v4.pth')
+    best_name = f'best_model_v4{fold_suffix}.pth' if fold_suffix else 'best_model_v4.pth'
+    best_path = str(Path(cfg.out_dir) / best_name)
     train_history: List[float] = []
     val_history: List[float] = []
 
@@ -224,7 +364,9 @@ def train_fusion_regressor(cfg: TrainConfig, model: LettuceMultiBranchCNN, train
         val_mae = val_mae_sum / max(1, n_val)
         train_history.append(train_mae)
         val_history.append(val_mae)
-        print(f"[train] epoch {epoch+1}/{cfg.num_epochs} train_mae={train_mae:.4f} val_mae={val_mae:.4f}")
+        current_lr = optimizer.param_groups[0]['lr']
+        prefix = f"[train][{fold_label}]" if fold_label else '[train]'
+        print(f"{prefix} epoch {epoch+1}/{cfg.num_epochs} lr={current_lr:.3e} train_mae={train_mae:.4f} val_mae={val_mae:.4f}")
 
         if val_mae <= stopper.best:
             save_checkpoint(best_path, model)
@@ -232,7 +374,9 @@ def train_fusion_regressor(cfg: TrainConfig, model: LettuceMultiBranchCNN, train
             print(f"[train] early stop at epoch {epoch+1} (best val_mae={stopper.best:.4f})")
             break
 
-    return best_path, train_history, val_history
+        scheduler.step(val_mae)
+
+    return best_path, train_history, val_history, stopper.best
 
 
 def main():
@@ -242,14 +386,36 @@ def main():
     seed_everything(cfg.seed, deterministic=True)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-    train_loader, val_loader = make_loaders(cfg)
-    model = LettuceMultiBranchCNN().to(device)
+    fold_loaders = make_fold_loaders(cfg)
+    total_folds = len(fold_loaders)
+    fold_results = []
 
-    print('[train] training fusion regressor...')
-    best_full, train_hist, val_hist = train_fusion_regressor(cfg, model, train_loader, val_loader, device)
-    save_training_curves(train_hist, val_hist, cfg.out_dir)
+    for fold_idx, (train_loader, val_loader, label) in enumerate(fold_loaders, 1):
+        fold_suffix = f'_{label}' if total_folds > 1 else ''
+        model = LettuceMultiBranchCNN().to(device)
+        print(f"[train] training fusion regressor ({label})...")
+        best_full, train_hist, val_hist, best_val = train_fusion_regressor(
+            cfg,
+            model,
+            train_loader,
+            val_loader,
+            device,
+            fold_suffix=fold_suffix,
+            fold_label=label,
+        )
+        save_training_curves(train_hist, val_hist, cfg.out_dir, suffix=fold_suffix)
+        fold_results.append((label, best_full, best_val))
+        print(f"[train] fold {label} best checkpoint: {best_full} (val_mae={best_val:.4f})")
 
-    print(f"Done. Best full model saved to: {best_full}")
+    if total_folds > 1:
+        print('\nCross-validation summary:')
+        for label, path, best_val in fold_results:
+            print(f"  - {label}: best_val_mae={best_val:.4f} ({path})")
+        avg_val = float(np.mean([val for _, _, val in fold_results]))
+        print(f"Average best val MAE: {avg_val:.4f}")
+    else:
+        label, path, best_val = fold_results[0]
+        print(f"Done. Best full model saved to: {path} (val_mae={best_val:.4f})")
 
 
 if __name__ == '__main__':
