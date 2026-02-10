@@ -4,27 +4,63 @@ import torch
 import torch.nn as nn
 
 
-class BottleneckBlock(nn.Module):
-    """1x1 -> 3x3 -> 1x1 bottleneck followed by pooling."""
+class DropPath(nn.Module):
+    """Stochastic depth (a.k.a. DropPath)."""
 
-    def __init__(self, in_ch: int, out_ch: int, *, reduction: int = 4):
+    def __init__(self, drop_prob: float = 0.0):
+        super().__init__()
+        self.drop_prob = float(drop_prob)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:  # type: ignore[override]
+        if self.drop_prob <= 0.0 or not self.training:
+            return x
+        keep_prob = 1.0 - self.drop_prob
+        shape = (x.shape[0],) + (1,) * (x.ndim - 1)
+        random_tensor = x.new_empty(shape).bernoulli_(keep_prob)
+        return x.div(keep_prob) * random_tensor
+
+
+class BottleneckBlock(nn.Module):
+    """1x1 -> 3x3 -> 1x1 bottleneck with residual + pooling."""
+
+    def __init__(self, in_ch: int, out_ch: int, *, reduction: int = 4, drop_prob: float = 0.0):
         super().__init__()
         mid_ch = max(1, out_ch // max(1, reduction))
-        self.net = nn.Sequential(
+        self.conv1 = nn.Sequential(
             nn.Conv2d(in_ch, mid_ch, kernel_size=1, bias=False),
             nn.BatchNorm2d(mid_ch),
             nn.ReLU(inplace=True),
+        )
+        self.conv2 = nn.Sequential(
             nn.Conv2d(mid_ch, mid_ch, kernel_size=3, padding=1, bias=False),
             nn.BatchNorm2d(mid_ch),
             nn.ReLU(inplace=True),
+        )
+        self.conv3 = nn.Sequential(
             nn.Conv2d(mid_ch, out_ch, kernel_size=1, bias=False),
             nn.BatchNorm2d(out_ch),
-            nn.ReLU(inplace=True),
-            nn.MaxPool2d(kernel_size=2),
         )
+        self.downsample = None
+        if in_ch != out_ch:
+            self.downsample = nn.Sequential(
+                nn.Conv2d(in_ch, out_ch, kernel_size=1, bias=False),
+                nn.BatchNorm2d(out_ch),
+            )
+        self.drop_path = DropPath(drop_prob) if drop_prob > 0.0 else nn.Identity()
+        self.activation = nn.ReLU(inplace=True)
+        self.pool = nn.MaxPool2d(kernel_size=2)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x)
+        identity = x
+        out = self.conv1(x)
+        out = self.conv2(out)
+        out = self.conv3(out)
+        if self.downsample is not None:
+            identity = self.downsample(identity)
+        out = identity + self.drop_path(out)
+        out = self.activation(out)
+        out = self.pool(out)
+        return out
 
 
 class SpatialAttentionModule(nn.Module):
@@ -45,17 +81,29 @@ class SpatialAttentionModule(nn.Module):
         return x * scale
 
 
+def _drop_rates(num_blocks: int, drop_path_prob: float) -> Tuple[float, ...]:
+    if num_blocks <= 0:
+        return tuple()
+    if drop_path_prob <= 0.0:
+        return tuple(0.0 for _ in range(num_blocks))
+    if num_blocks == 1:
+        return (drop_path_prob,)
+    return tuple(drop_path_prob * i / (num_blocks - 1) for i in range(num_blocks))
+
+
 class RGBRegressionBranch(nn.Module):
     """Processes RGB inputs, outputs both scalar prediction and pooled features."""
 
-    def __init__(self, in_channels: int = 3, dropout: float = 0.2):
+    def __init__(self, in_channels: int = 3, dropout: float = 0.2, drop_path_prob: float = 0.0):
         super().__init__()
-        self.features = nn.Sequential(
-            BottleneckBlock(in_channels, 32),
-            BottleneckBlock(32, 64),
-            BottleneckBlock(64, 128),
-            BottleneckBlock(128, 256),
-        )
+        widths = (32, 64, 128, 256)
+        drops = _drop_rates(len(widths), drop_path_prob)
+        layers = []
+        c_in = in_channels
+        for width, drop in zip(widths, drops):
+            layers.append(BottleneckBlock(c_in, width, drop_prob=drop))
+            c_in = width
+        self.features = nn.Sequential(*layers)
         self.spatial_attn = SpatialAttentionModule(kernel_size=7)
         self.global_pool = nn.AdaptiveAvgPool2d((1, 1))
         self.embedding = nn.Sequential(
@@ -78,14 +126,16 @@ class RGBRegressionBranch(nn.Module):
 class RGBDRegressionBranch(nn.Module):
     """Processes RGBD inputs, outputs both scalar prediction and pooled features."""
 
-    def __init__(self, in_channels: int = 4, dropout: float = 0.2):
+    def __init__(self, in_channels: int = 4, dropout: float = 0.2, drop_path_prob: float = 0.0):
         super().__init__()
-        self.features = nn.Sequential(
-            BottleneckBlock(in_channels, 32),
-            BottleneckBlock(32, 64),
-            BottleneckBlock(64, 128),
-            BottleneckBlock(128, 256),
-        )
+        widths = (32, 64, 128, 256)
+        drops = _drop_rates(len(widths), drop_path_prob)
+        layers = []
+        c_in = in_channels
+        for width, drop in zip(widths, drops):
+            layers.append(BottleneckBlock(c_in, width, drop_prob=drop))
+            c_in = width
+        self.features = nn.Sequential(*layers)
         self.spatial_attn = SpatialAttentionModule(kernel_size=7)
         self.global_pool = nn.AdaptiveAvgPool2d((1, 1))
         self.embedding = nn.Sequential(
@@ -125,10 +175,10 @@ class FusionMLP(nn.Module):
 class LettuceSAMFusionNet(nn.Module):
     """Dual-branch CNN with spatial attention + fusion head."""
 
-    def __init__(self):
+    def __init__(self, drop_path_prob: float = 0.1):
         super().__init__()
-        self.rgb_branch = RGBRegressionBranch()
-        self.rgbd_branch = RGBDRegressionBranch()
+        self.rgb_branch = RGBRegressionBranch(drop_path_prob=drop_path_prob)
+        self.rgbd_branch = RGBDRegressionBranch(drop_path_prob=drop_path_prob)
         self.fusion = FusionMLP(in_dim=512)
 
     def forward(self, rgb: torch.Tensor, rgbd: torch.Tensor):
