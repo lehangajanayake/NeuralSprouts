@@ -25,7 +25,7 @@ class TrainConfig:
     rgb_dir: str = '../../datasets/Training/Augmented/RGBImages'
     depth_dir: str = '../../datasets/Training/Augmented/DepthImages'
 
-    batch_size: int = 64  
+    batch_size: int = 128 
     num_epochs: int = 200
     lr: float = 1e-3    
     weight_decay: float = 1e-4
@@ -33,12 +33,12 @@ class TrainConfig:
     scheduler_patience: int = 10
     scheduler_min_lr: float = 1e-6
 
-    val_ratio: float = 0.4
+    val_ratio: float = 0.3
     seed: int = 42
-    patience: int = 50
+    patience: int =30
     # Matches 1 + num_aug_per_image from preprocess.py
-    outputs_per_original: int = 31
-    num_folds: int = 3
+    outputs_per_original: int = 21
+    num_folds: int = 1
 
     preload_to_gpu: bool = False
     preload_device: str = 'cuda'

@@ -1,7 +1,6 @@
 import os
 import random
 import concurrent.futures as cf
-import math
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
@@ -26,10 +25,10 @@ class PreprocessConfig:
     out_csv: str = '../../datasets/Training/Augmented/Train_aug.csv'
 
     image_size: int = 96
-    crop_size: int = 1000
+    crop_size: int = 1000  # minimum side length for random crops
 
     # how many augmented variants per original (not counting the original)
-    num_aug_per_image: int = 30
+    num_aug_per_image: int = 50
     max_center_shift: int = 100  # max pixel shift for random pre-crop translations
     seed: int = 42
 
@@ -71,15 +70,34 @@ def shifted_center_crop(img: Image.Image, crop_size: int, shift: Tuple[int, int]
 
 
 def random_center_shift(rng: np.random.RandomState, max_shift: int) -> Tuple[int, int]:
+    """Sample a deterministic shift whose magnitude is in [0, max_shift]."""
+
     if max_shift <= 0:
         return 0, 0
-    pixels = int(rng.randint(0, max_shift + 1))
-    if pixels == 0:
-        return 0, 0
-    angle = rng.uniform(0.0, 2.0 * math.pi)
-    dx = int(round(pixels * math.cos(angle)))
-    dy = int(round(pixels * math.sin(angle)))
-    return dx, dy
+
+    def _sample_axis() -> int:
+        magnitude = int(rng.randint(0, max_shift + 1))
+        if magnitude == 0:
+            return 0
+        sign = -1 if rng.rand() < 0.5 else 1
+        return sign * magnitude
+
+    return _sample_axis(), _sample_axis()
+
+
+def random_crop_size(
+    rgb: Image.Image,
+    depth: Image.Image,
+    cfg: PreprocessConfig,
+    rng: np.random.RandomState,
+) -> int:
+    """Return a crop side sampled between the full frame and cfg.crop_size."""
+
+    max_crop = min(min(rgb.size), min(depth.size))
+    min_crop = min(int(cfg.crop_size), max_crop)
+    if min_crop >= max_crop:
+        return max_crop
+    return int(rng.randint(min_crop, max_crop + 1))
 
 
 def apply_aug(rgb: Image.Image, depth: Image.Image, rng: np.random.RandomState) -> Tuple[Image.Image, Image.Image]:
@@ -113,14 +131,19 @@ def preprocess_one(
     rgb: Image.Image,
     depth: Image.Image,
     cfg: PreprocessConfig,
+    rng: np.random.RandomState,
     shift: Optional[Tuple[int, int]] = None,
 ) -> Tuple[Image.Image, Image.Image]:
-    if shift is not None and shift != (0, 0):
-        rgb = shifted_center_crop(rgb, cfg.crop_size, shift)
-        depth = shifted_center_crop(depth, cfg.crop_size, shift)
+    crop_side = random_crop_size(rgb, depth, cfg, rng)
+    if shift is None:
+        shift = random_center_shift(rng, int(cfg.max_center_shift))
+
+    if shift != (0, 0):
+        rgb = shifted_center_crop(rgb, crop_side, shift)
+        depth = shifted_center_crop(depth, crop_side, shift)
     else:
-        rgb = center_crop(rgb, cfg.crop_size)
-        depth = center_crop(depth, cfg.crop_size)
+        rgb = center_crop(rgb, crop_side)
+        depth = center_crop(depth, crop_side)
 
     rgb = rgb.resize((cfg.image_size, cfg.image_size), resample=Image.BILINEAR)
     depth = depth.resize((cfg.image_size, cfg.image_size), resample=Image.BILINEAR)
@@ -160,7 +183,9 @@ def _process_one_row(args) -> List[Dict]:
     out_rows: List[Dict] = []
 
     # original (no aug)
-    rgb, depth = preprocess_one(rgb0, depth0, cfg)
+    base_rng = np.random.RandomState(int(cfg.seed) + orig_id)
+    shift0 = random_center_shift(base_rng, int(cfg.max_center_shift))
+    rgb, depth = preprocess_one(rgb0, depth0, cfg, base_rng, shift=shift0)
     rgb.save(os.path.join(cfg.out_rgb_dir, f'RGB_{base_out_id}.png'))
     depth.save(os.path.join(cfg.out_depth_dir, f'Depth_{base_out_id}.png'))
     r0 = dict(row_dict)
@@ -174,7 +199,7 @@ def _process_one_row(args) -> List[Dict]:
         rng = np.random.RandomState(int(cfg.seed) + orig_id * 100 + k)
         rgb_aug, depth_aug = apply_aug(rgb0, depth0, rng)
         shift = random_center_shift(rng, int(cfg.max_center_shift))
-        rgb_aug, depth_aug = preprocess_one(rgb_aug, depth_aug, cfg, shift=shift)
+        rgb_aug, depth_aug = preprocess_one(rgb_aug, depth_aug, cfg, rng, shift=shift)
 
         rgb_aug.save(os.path.join(cfg.out_rgb_dir, f'RGB_{out_id}.png'))
         depth_aug.save(os.path.join(cfg.out_depth_dir, f'Depth_{out_id}.png'))

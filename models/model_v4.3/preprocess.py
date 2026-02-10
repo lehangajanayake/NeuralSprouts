@@ -29,8 +29,8 @@ class PreprocessConfig:
     crop_size: int = 1000
 
     # how many augmented variants per original (not counting the original)
-    num_aug_per_image: int = 30
-    max_center_shift: int = 100  # max pixel shift for random pre-crop translations
+    num_aug_per_image: int = 20
+    max_center_shift: int = 0  # max pixel shift for random pre-crop translations
     mixup_prob: float = 0.4
     mixup_alpha: float = 0.4
     seed: int = 42
