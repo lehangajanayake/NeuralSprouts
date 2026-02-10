@@ -18,8 +18,26 @@ class ConvBlock(nn.Module):
         return self.net(x)
 
 
+class SpatialAttentionModule(nn.Module):
+    """Spatial attention block from CBAM (avg + max pooling along channels)."""
+
+    def __init__(self, kernel_size: int = 7):
+        super().__init__()
+        padding = kernel_size // 2
+        self.conv = nn.Conv2d(2, 1, kernel_size=kernel_size, padding=padding, bias=False)
+        self.activation = nn.Sigmoid()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        avg_out = torch.mean(x, dim=1, keepdim=True)
+        max_out, _ = torch.max(x, dim=1, keepdim=True)
+        attn = torch.cat([avg_out, max_out], dim=1)
+        attn = self.conv(attn)
+        scale = self.activation(attn)
+        return x * scale
+
+
 class RGBRegressionBranch(nn.Module):
-    """Processes RGB inputs, exposes pooled features + scalar head."""
+    """Processes RGB inputs, outputs both scalar prediction and pooled features."""
 
     def __init__(self, in_channels: int = 3, dropout: float = 0.2):
         super().__init__()
@@ -29,6 +47,7 @@ class RGBRegressionBranch(nn.Module):
             ConvBlock(64, 128),
             ConvBlock(128, 256),
         )
+        self.spatial_attn = SpatialAttentionModule(kernel_size=7)
         self.global_pool = nn.AdaptiveAvgPool2d((1, 1))
         self.embedding = nn.Sequential(
             nn.Flatten(),
@@ -40,6 +59,7 @@ class RGBRegressionBranch(nn.Module):
 
     def forward(self, rgb: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         x = self.features(rgb)
+        x = self.spatial_attn(x)
         pooled = self.global_pool(x)
         features = self.embedding(pooled)
         pred = self.regressor(features).squeeze(-1)
@@ -47,7 +67,7 @@ class RGBRegressionBranch(nn.Module):
 
 
 class RGBDRegressionBranch(nn.Module):
-    """Processes RGBD inputs, exposes pooled features + scalar head."""
+    """Processes RGBD inputs, outputs both scalar prediction and pooled features."""
 
     def __init__(self, in_channels: int = 4, dropout: float = 0.2):
         super().__init__()
@@ -57,6 +77,7 @@ class RGBDRegressionBranch(nn.Module):
             ConvBlock(64, 128),
             ConvBlock(128, 256),
         )
+        self.spatial_attn = SpatialAttentionModule(kernel_size=7)
         self.global_pool = nn.AdaptiveAvgPool2d((1, 1))
         self.embedding = nn.Sequential(
             nn.Flatten(),
@@ -68,6 +89,7 @@ class RGBDRegressionBranch(nn.Module):
 
     def forward(self, rgbd: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         x = self.features(rgbd)
+        x = self.spatial_attn(x)
         pooled = self.global_pool(x)
         features = self.embedding(pooled)
         pred = self.regressor(features).squeeze(-1)
@@ -91,8 +113,8 @@ class FusionMLP(nn.Module):
         return self.net(x).squeeze(-1)
 
 
-class LettuceMultiBranchCNN(nn.Module):
-    """Two regression branches + fusion for dry-weight prediction."""
+class LettuceSAMFusionNet(nn.Module):
+    """Dual-branch CNN with spatial attention + fusion head."""
 
     def __init__(self):
         super().__init__()
