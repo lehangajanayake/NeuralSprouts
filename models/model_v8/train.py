@@ -13,9 +13,9 @@ from torch.utils.data import DataLoader, Dataset, Subset
 from dataloader import PlantDatasetV8
 from model import LettuceSAMFusionNet
 
-RGB_LOSS_WEIGHT = 0.3
-RGBD_LOSS_WEIGHT = 0.3
-FUSION_LOSS_WEIGHT = 0.4
+RGB_LOSS_WEIGHT = 0.2
+RGBD_LOSS_WEIGHT = 0.2
+FUSION_LOSS_WEIGHT = 0.6
 
 try:
     import matplotlib.pyplot as plt
