@@ -4,11 +4,20 @@ import torch
 import torch.nn as nn
 
 
-class ConvBlock(nn.Module):
-    def __init__(self, in_ch: int, out_ch: int, *, k: int = 3, p: int = 1):
+class BottleneckBlock(nn.Module):
+    """1x1 -> 3x3 -> 1x1 bottleneck followed by pooling."""
+
+    def __init__(self, in_ch: int, out_ch: int, *, reduction: int = 4):
         super().__init__()
+        mid_ch = max(1, out_ch // max(1, reduction))
         self.net = nn.Sequential(
-            nn.Conv2d(in_ch, out_ch, kernel_size=k, padding=p, bias=False),
+            nn.Conv2d(in_ch, mid_ch, kernel_size=1, bias=False),
+            nn.BatchNorm2d(mid_ch),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(mid_ch, mid_ch, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(mid_ch),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(mid_ch, out_ch, kernel_size=1, bias=False),
             nn.BatchNorm2d(out_ch),
             nn.ReLU(inplace=True),
             nn.MaxPool2d(kernel_size=2),
@@ -42,10 +51,10 @@ class RGBRegressionBranch(nn.Module):
     def __init__(self, in_channels: int = 3, dropout: float = 0.2):
         super().__init__()
         self.features = nn.Sequential(
-            ConvBlock(in_channels, 32),
-            ConvBlock(32, 64),
-            ConvBlock(64, 128),
-            ConvBlock(128, 256),
+            BottleneckBlock(in_channels, 32),
+            BottleneckBlock(32, 64),
+            BottleneckBlock(64, 128),
+            BottleneckBlock(128, 256),
         )
         self.spatial_attn = SpatialAttentionModule(kernel_size=7)
         self.global_pool = nn.AdaptiveAvgPool2d((1, 1))
@@ -72,10 +81,10 @@ class RGBDRegressionBranch(nn.Module):
     def __init__(self, in_channels: int = 4, dropout: float = 0.2):
         super().__init__()
         self.features = nn.Sequential(
-            ConvBlock(in_channels, 32),
-            ConvBlock(32, 64),
-            ConvBlock(64, 128),
-            ConvBlock(128, 256),
+            BottleneckBlock(in_channels, 32),
+            BottleneckBlock(32, 64),
+            BottleneckBlock(64, 128),
+            BottleneckBlock(128, 256),
         )
         self.spatial_attn = SpatialAttentionModule(kernel_size=7)
         self.global_pool = nn.AdaptiveAvgPool2d((1, 1))

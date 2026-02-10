@@ -13,6 +13,10 @@ from torch.utils.data import DataLoader, Dataset, Subset
 from dataloader import PlantDatasetV8
 from model import LettuceSAMFusionNet
 
+RGB_LOSS_WEIGHT = 0.3
+RGBD_LOSS_WEIGHT = 0.3
+FUSION_LOSS_WEIGHT = 0.4
+
 try:
     import matplotlib.pyplot as plt
 except Exception:  # pragma: no cover
@@ -329,6 +333,7 @@ def train_fusion_regressor(
     for epoch in range(cfg.num_epochs):
         model.train()
         train_mae_sum, n_train = 0.0, 0
+        train_sup_loss_sum = 0.0
 
         for batch in train_loader:
             rgb = batch['rgb'].to(device, non_blocking=True)
@@ -336,36 +341,59 @@ def train_fusion_regressor(
             y = batch['dry_weight'].to(device, non_blocking=True)
 
             optimizer.zero_grad(set_to_none=True)
-            _, _, fusion_pred = model(rgb, rgbd)
-            loss = criterion(fusion_pred, y)
+            rgb_pred, rgbd_pred, fusion_pred = model(rgb, rgbd)
+            loss_rgb = criterion(rgb_pred, y)
+            loss_rgbd = criterion(rgbd_pred, y)
+            loss_fusion = criterion(fusion_pred, y)
+            loss = (
+                RGB_LOSS_WEIGHT * loss_rgb
+                + RGBD_LOSS_WEIGHT * loss_rgbd
+                + FUSION_LOSS_WEIGHT * loss_fusion
+            )
             loss.backward()
             optimizer.step()
 
             bs = y.size(0)
-            train_mae_sum += loss.item() * bs
+            train_sup_loss_sum += loss.item() * bs
+            train_mae_sum += loss_fusion.item() * bs
             n_train += bs
 
         model.eval()
         val_mae_sum, n_val = 0.0, 0
+        val_sup_loss_sum = 0.0
         with torch.no_grad():
             for batch in val_loader:
                 rgb = batch['rgb'].to(device, non_blocking=True)
                 rgbd = batch['rgbd'].to(device, non_blocking=True)
                 y = batch['dry_weight'].to(device, non_blocking=True)
 
-                _, _, fusion_pred = model(rgb, rgbd)
-                loss = criterion(fusion_pred, y)
+                rgb_pred, rgbd_pred, fusion_pred = model(rgb, rgbd)
+                loss_rgb = criterion(rgb_pred, y)
+                loss_rgbd = criterion(rgbd_pred, y)
+                loss_fusion = criterion(fusion_pred, y)
+                val_loss = (
+                    RGB_LOSS_WEIGHT * loss_rgb
+                    + RGBD_LOSS_WEIGHT * loss_rgbd
+                    + FUSION_LOSS_WEIGHT * loss_fusion
+                )
                 bs = y.size(0)
-                val_mae_sum += loss.item() * bs
+                val_sup_loss_sum += val_loss.item() * bs
+                val_mae_sum += loss_fusion.item() * bs
                 n_val += bs
 
         train_mae = train_mae_sum / max(1, n_train)
         val_mae = val_mae_sum / max(1, n_val)
+        train_sup_loss = train_sup_loss_sum / max(1, n_train)
+        val_sup_loss = val_sup_loss_sum / max(1, n_val)
         train_history.append(train_mae)
         val_history.append(val_mae)
         current_lr = optimizer.param_groups[0]['lr']
         prefix = f"[train][{fold_label}]" if fold_label else '[train]'
-        print(f"{prefix} epoch {epoch+1}/{cfg.num_epochs} lr={current_lr:.3e} train_mae={train_mae:.4f} val_mae={val_mae:.4f}")
+        print(
+            f"{prefix} epoch {epoch+1}/{cfg.num_epochs} lr={current_lr:.3e} "
+            f"train_mae={train_mae:.4f} val_mae={val_mae:.4f} "
+            f"train_loss={train_sup_loss:.4f} val_loss={val_sup_loss:.4f}"
+        )
 
         if val_mae <= stopper.best:
             save_checkpoint(best_path, model)
