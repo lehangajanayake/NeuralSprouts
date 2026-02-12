@@ -29,8 +29,8 @@ class PreprocessConfig:
     randomize_crop: bool = False  # allow disabling random crop-size sampling
 
     # how many augmented variants per original (not counting the original)
-    num_aug_per_image: int = 40
-    max_center_shift: int = 20 # max pixel shift for random pre-crop translations
+    num_aug_per_image: int = 50
+    max_center_shift: int = 50 # max pixel shift for random pre-crop translations
     seed: int = 42
     depth_noise_std: float = 0.03  # Gaussian noise std (0-1 range) applied to depth channel
     depth_noise_prob: float = 0.7  # Probability of applying depth noise to a sample
@@ -155,7 +155,7 @@ def apply_aug(
         rgb = T.functional.rotate(rgb, angle)
         depth = T.functional.rotate(depth, angle)
 
-    cj = T.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.02)
+    cj = T.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3, hue=0.03)
     if rng.rand() < max(0.0, min(1.0, float(cfg.color_jitter_prob))):
         rgb = cj(rgb)
     depth = _maybe_apply_depth_noise(depth, rng, cfg.depth_noise_std, cfg.depth_noise_prob)
