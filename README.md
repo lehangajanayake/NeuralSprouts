@@ -56,4 +56,10 @@ NeuralSprouts/
   - Phenotype feature extraction
   - K-fold cross-validation and ensemble inference
 
+### Recent dual-branch family
+
+- **[model_v4.2](models/model_v4.2/README.md)**: Production baseline with parallel RGB and RGBD conv stacks, random center-crop augmentation, and a single fusion head trained purely on MAE.
+- **[model_v8](models/model_v8/README.md)**: Adds bottleneck residual blocks, stochastic depth, and a CBAM-style spatial attention module plus deep supervision on both branches.
+- **[model_v9](models/model_v9/README.md)**: Extends v8 by concatenating Sobel-derived surface normals with RGB, enabling the network to reason about geometry as well as color.
+
 Each model folder contains its own README with detailed architecture descriptions, usage instructions, and training guides. 
