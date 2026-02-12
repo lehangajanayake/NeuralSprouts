@@ -1,3 +1,4 @@
+import copy
 import os
 import random
 import shutil
@@ -50,6 +51,7 @@ class TrainConfig:
     out_dir: str = '.'
     blacklist_ids: Tuple[int, ...] = (163,)
     best_mae_window: int = 5
+    ema_decay: float = 0.995
 
 
 def seed_everything(seed: int = 42, deterministic: bool = True):
@@ -68,6 +70,23 @@ def seed_worker(worker_id: int):
     worker_seed = torch.initial_seed() % 2**32
     np.random.seed(worker_seed)
     random.seed(worker_seed)
+
+
+def update_ema_model(ema_model: nn.Module, model: nn.Module, decay: float) -> None:
+    decay = float(decay)
+    if decay <= 0.0:
+        return
+    with torch.no_grad():
+        ema_params = dict(ema_model.named_parameters())
+        model_params = dict(model.named_parameters())
+        for name, param in model_params.items():
+            ema_param = ema_params.get(name)
+            if ema_param is None:
+                continue
+            ema_param.mul_(decay).add_(param, alpha=1.0 - decay)
+        # Keep buffers (e.g., BatchNorm stats) in sync
+        for ema_buf, buf in zip(ema_model.buffers(), model.buffers()):
+            ema_buf.copy_(buf)
 
 
 class TensorDictDataset(Dataset):
@@ -124,7 +143,7 @@ def _build_full_dataset(cfg: TrainConfig) -> PlantDatasetV8:
         cfg.rgb_dir,
         cfg.depth_dir,
         cfg.train_csv,
-        augment=True,
+        augment=False,
         seed=cfg.seed,
         enable_cache=True,
         num_views=1,
@@ -334,83 +353,104 @@ def train_fusion_regressor(
     train_history: List[float] = []
     val_history: List[float] = []
     mae_window = max(1, int(cfg.best_mae_window))
+    use_ema = cfg.ema_decay is not None and float(cfg.ema_decay) > 0.0
+    ema_model = None
+    if use_ema:
+        ema_model = copy.deepcopy(model).to(device)
+        for param in ema_model.parameters():
+            param.requires_grad_(False)
+    best_saved = False
+    interrupted = False
+    try:
+        for epoch in range(cfg.num_epochs):
+            model.train()
+            train_mae_sum, n_train = 0.0, 0
+            train_sup_loss_sum = 0.0
 
-    for epoch in range(cfg.num_epochs):
-        model.train()
-        train_mae_sum, n_train = 0.0, 0
-        train_sup_loss_sum = 0.0
-
-        for batch in train_loader:
-            rgb = batch['rgb'].to(device, non_blocking=True)
-            rgbd = batch['rgbd'].to(device, non_blocking=True)
-            y = batch['dry_weight'].to(device, non_blocking=True)
-
-            optimizer.zero_grad(set_to_none=True)
-            rgb_pred, rgbd_pred, fusion_pred = model(rgb, rgbd)
-            loss_rgb = criterion(rgb_pred, y)
-            loss_rgbd = criterion(rgbd_pred, y)
-            loss_fusion = criterion(fusion_pred, y)
-            loss = (
-                RGB_LOSS_WEIGHT * loss_rgb
-                + RGBD_LOSS_WEIGHT * loss_rgbd
-                + FUSION_LOSS_WEIGHT * loss_fusion
-            )
-            loss.backward()
-            optimizer.step()
-
-            bs = y.size(0)
-            train_sup_loss_sum += loss.item() * bs
-            train_mae_sum += loss_fusion.item() * bs
-            n_train += bs
-
-        model.eval()
-        val_mae_sum, n_val = 0.0, 0
-        val_sup_loss_sum = 0.0
-        with torch.no_grad():
-            for batch in val_loader:
+            for batch in train_loader:
                 rgb = batch['rgb'].to(device, non_blocking=True)
                 rgbd = batch['rgbd'].to(device, non_blocking=True)
                 y = batch['dry_weight'].to(device, non_blocking=True)
 
+                optimizer.zero_grad(set_to_none=True)
                 rgb_pred, rgbd_pred, fusion_pred = model(rgb, rgbd)
                 loss_rgb = criterion(rgb_pred, y)
                 loss_rgbd = criterion(rgbd_pred, y)
                 loss_fusion = criterion(fusion_pred, y)
-                val_loss = (
+                loss = (
                     RGB_LOSS_WEIGHT * loss_rgb
                     + RGBD_LOSS_WEIGHT * loss_rgbd
                     + FUSION_LOSS_WEIGHT * loss_fusion
                 )
+                loss.backward()
+                optimizer.step()
+                if use_ema and ema_model is not None:
+                    update_ema_model(ema_model, model, cfg.ema_decay)
+
                 bs = y.size(0)
-                val_sup_loss_sum += val_loss.item() * bs
-                val_mae_sum += loss_fusion.item() * bs
-                n_val += bs
+                train_sup_loss_sum += loss.item() * bs
+                train_mae_sum += loss_fusion.item() * bs
+                n_train += bs
 
-        train_mae = train_mae_sum / max(1, n_train)
-        val_mae = val_mae_sum / max(1, n_val)
-        train_sup_loss = train_sup_loss_sum / max(1, n_train)
-        val_sup_loss = val_sup_loss_sum / max(1, n_val)
-        train_history.append(train_mae)
-        val_history.append(val_mae)
-        smooth_span = min(mae_window, len(val_history))
-        smooth_val_mae = float(np.mean(val_history[-smooth_span:]))
-        current_lr = optimizer.param_groups[0]['lr']
-        prefix = f"[train][{fold_label}]" if fold_label else '[train]'
-        print(
-            f"{prefix} epoch {epoch+1}/{cfg.num_epochs} lr={current_lr:.3e} "
-            f"train_mae={train_mae:.4f} val_mae={val_mae:.4f} "
-            f"smoothed_val_mae({smooth_span})={smooth_val_mae:.4f} "
-            f"train_loss={train_sup_loss:.4f} val_loss={val_sup_loss:.4f}"
-        )
+            model.eval()
+            val_mae_sum, n_val = 0.0, 0
+            val_sup_loss_sum = 0.0
+            with torch.no_grad():
+                for batch in val_loader:
+                    rgb = batch['rgb'].to(device, non_blocking=True)
+                    rgbd = batch['rgbd'].to(device, non_blocking=True)
+                    y = batch['dry_weight'].to(device, non_blocking=True)
 
-        if smooth_val_mae <= stopper.best:
-            save_checkpoint(best_path, model)
-        if stopper.step(smooth_val_mae):
-            print(f"[train] early stop at epoch {epoch+1} (best val_mae={stopper.best:.4f})")
-            break
+                    rgb_pred, rgbd_pred, fusion_pred = model(rgb, rgbd)
+                    loss_rgb = criterion(rgb_pred, y)
+                    loss_rgbd = criterion(rgbd_pred, y)
+                    loss_fusion = criterion(fusion_pred, y)
+                    val_loss = (
+                        RGB_LOSS_WEIGHT * loss_rgb
+                        + RGBD_LOSS_WEIGHT * loss_rgbd
+                        + FUSION_LOSS_WEIGHT * loss_fusion
+                    )
+                    bs = y.size(0)
+                    val_sup_loss_sum += val_loss.item() * bs
+                    val_mae_sum += loss_fusion.item() * bs
+                    n_val += bs
 
-        scheduler.step(val_mae)
+            train_mae = train_mae_sum / max(1, n_train)
+            val_mae = val_mae_sum / max(1, n_val)
+            train_sup_loss = train_sup_loss_sum / max(1, n_train)
+            val_sup_loss = val_sup_loss_sum / max(1, n_val)
+            train_history.append(train_mae)
+            val_history.append(val_mae)
+            smooth_span = min(mae_window, len(val_history))
+            smooth_val_mae = float(np.mean(val_history[-smooth_span:]))
+            current_lr = optimizer.param_groups[0]['lr']
+            prefix = f"[train][{fold_label}]" if fold_label else '[train]'
+            print(
+                f"{prefix} epoch {epoch+1}/{cfg.num_epochs} lr={current_lr:.3e} "
+                f"train_mae={train_mae:.4f} val_mae={val_mae:.4f} "
+                f"smoothed_val_mae({smooth_span})={smooth_val_mae:.4f} "
+                f"train_loss={train_sup_loss:.4f} val_loss={val_sup_loss:.4f}"
+            )
 
+            if smooth_val_mae <= stopper.best:
+                target = ema_model if use_ema and ema_model is not None else model
+                save_checkpoint(best_path, target)
+                best_saved = True
+            if stopper.step(smooth_val_mae):
+                print(f"[train] early stop at epoch {epoch+1} (best val_mae={stopper.best:.4f})")
+                break
+
+            scheduler.step(val_mae)
+    except KeyboardInterrupt:
+        interrupted = True
+        print('\n[train] KeyboardInterrupt received; saving current progress...')
+
+    target = ema_model if use_ema and ema_model is not None else model
+    if not best_saved or not os.path.exists(best_path):
+        save_checkpoint(best_path, target)
+        best_saved = True
+    if interrupted:
+        print(f"[train] interrupted — best checkpoint saved to {best_path}")
     return best_path, train_history, val_history, stopper.best
 
 
