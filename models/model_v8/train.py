@@ -4,7 +4,7 @@ import random
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Sequence, Tuple
+from typing import Callable, Dict, List, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -32,7 +32,7 @@ class TrainConfig:
     depth_dir: str = '../../datasets/Training/Augmented_v8/DepthImages'
 
     batch_size: int = 128
-    num_epochs: int = 200
+    num_epochs: int = 50
     lr: float = 1e-3
     weight_decay: float = 1e-4
     scheduler_factor: float = 0.5
@@ -42,7 +42,7 @@ class TrainConfig:
     val_ratio: float = 0.2
     seed: int = 43
     patience: int = 100
-    outputs_per_original: int = 21
+    outputs_per_original: int = 41
     num_folds: int = 1
 
     preload_to_gpu: bool = False
@@ -61,6 +61,13 @@ class TrainConfig:
     initial_frozen_rgb_blocks: int = 3
     initial_frozen_rgbd_blocks: int = 3
     unfreeze_interval: int = 5
+    rgb_unfreeze_interval: int = 5
+    rgbd_unfreeze_interval: int = 7
+    plateau_window: int = 3
+    plateau_delta: float = 0.01
+    branch_warmup_epochs: int = 2
+    branch_warmup_scale: float = 0.3
+    huber_delta: float = 0.2
 
 
 def seed_everything(seed: int = 42, deterministic: bool = True):
@@ -128,19 +135,96 @@ def apply_block_freezing(blocks: Sequence[nn.Module], frozen_count: int) -> None
 def maybe_unfreeze_blocks(
     epoch: int,
     interval: int,
+    val_history: Sequence[float],
+    plateau_window: int,
+    plateau_delta: float,
     current_frozen: int,
     blocks: Sequence[nn.Module],
     branch_name: str,
-) -> int:
-    if interval <= 0 or current_frozen <= 0:
-        return current_frozen
-    if (epoch + 1) % interval != 0:
-        return current_frozen
+    on_unfreeze: Callable[[int], None] | None = None,
+) -> Tuple[int, int | None]:
+    if current_frozen <= 0:
+        return current_frozen, None
+    interval_trigger = interval > 0 and (epoch + 1) % interval == 0
+    plateau_trigger = _val_plateaued(val_history, plateau_window, plateau_delta)
+    if not interval_trigger and not plateau_trigger:
+        return current_frozen, None
     new_frozen = max(0, current_frozen - 1)
-    if new_frozen != current_frozen:
-        apply_block_freezing(blocks, new_frozen)
-        print(f"[train] unfreezing {branch_name} block index {new_frozen}")
-    return new_frozen
+    if new_frozen == current_frozen:
+        return current_frozen, None
+    apply_block_freezing(blocks, new_frozen)
+    reason = 'plateau' if plateau_trigger and not interval_trigger else 'interval'
+    if plateau_trigger and interval_trigger:
+        reason = 'plateau+interval'
+    print(f"[train] unfreezing {branch_name} block index {new_frozen} (reason={reason})")
+    if on_unfreeze is not None:
+        on_unfreeze(new_frozen)
+    return new_frozen, new_frozen
+
+
+def _val_plateaued(val_history: Sequence[float], window: int, delta: float) -> bool:
+    if window <= 0 or len(val_history) < window * 2:
+        return False
+    recent = val_history[-window:]
+    previous = val_history[-window * 2 : -window]
+    prev_mean = float(np.mean(previous))
+    recent_mean = float(np.mean(recent))
+    return (prev_mean - recent_mean) <= float(delta)
+
+
+def start_block_warmup(
+    tracker: Dict[Tuple[str, int], Dict[str, int]],
+    branch: str,
+    block_idx: int,
+    epochs: int,
+) -> None:
+    epochs = max(0, int(epochs))
+    if epochs <= 0:
+        return
+    tracker[(branch, block_idx)] = {
+        'remaining': epochs,
+        'total': epochs,
+    }
+
+
+def apply_block_warmup_scaling(
+    tracker: Dict[Tuple[str, int], Dict[str, int]],
+    blocks_map: Dict[str, Sequence[nn.Module]],
+    min_scale: float,
+) -> None:
+    if not tracker:
+        return
+    min_scale = float(min_scale)
+    if min_scale >= 1.0:
+        return
+    clamped = max(0.0, min(1.0, min_scale))
+    for (branch, idx), state in tracker.items():
+        remaining = int(state.get('remaining', 0))
+        total = max(1, int(state.get('total', 1)))
+        if remaining <= 0:
+            continue
+        seq = blocks_map.get(branch)
+        if seq is None or idx < 0 or idx >= len(seq):
+            continue
+        progress = 1.0 - (remaining / total)
+        scale = clamped + (1.0 - clamped) * progress
+        block = seq[idx]
+        for param in block.parameters():
+            if param.grad is not None:
+                param.grad.mul_(scale)
+
+
+def decay_block_warmups(tracker: Dict[Tuple[str, int], Dict[str, int]]) -> None:
+    if not tracker:
+        return
+    to_remove: List[Tuple[str, int]] = []
+    for key, state in tracker.items():
+        remaining = int(state.get('remaining', 0)) - 1
+        state['remaining'] = remaining
+        if remaining <= 0:
+            to_remove.append(key)
+    for key in to_remove:
+        tracker.pop(key, None)
 
 
 class TensorDictDataset(Dataset):
@@ -395,7 +479,10 @@ def train_fusion_regressor(
     fold_suffix: str = '',
     fold_label: str = '',
 ):
-    criterion = nn.L1Loss()
+    if cfg.huber_delta is not None and float(cfg.huber_delta) > 0.0:
+        criterion = nn.SmoothL1Loss(beta=float(cfg.huber_delta))
+    else:
+        criterion = nn.L1Loss()
     optimizer = optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(
         optimizer,
@@ -422,6 +509,8 @@ def train_fusion_regressor(
     interrupted = False
     rgb_blocks = list(model.rgb_branch.features)
     rgbd_blocks = list(model.rgbd_branch.features)
+    blocks_map: Dict[str, Sequence[nn.Module]] = {'RGB': rgb_blocks, 'RGBD': rgbd_blocks}
+    block_warmups: Dict[Tuple[str, int], Dict[str, int]] = {}
     frozen_rgb = min(cfg.initial_frozen_rgb_blocks, len(rgb_blocks))
     frozen_rgbd = min(cfg.initial_frozen_rgbd_blocks, len(rgbd_blocks))
     if frozen_rgb > 0:
@@ -430,6 +519,15 @@ def train_fusion_regressor(
     if frozen_rgbd > 0:
         apply_block_freezing(rgbd_blocks, frozen_rgbd)
         print(f"[train] freezing first {frozen_rgbd} RGBD blocks")
+
+    rgb_interval = cfg.rgb_unfreeze_interval if cfg.rgb_unfreeze_interval > 0 else cfg.unfreeze_interval
+    rgbd_interval = cfg.rgbd_unfreeze_interval if cfg.rgbd_unfreeze_interval > 0 else cfg.unfreeze_interval
+
+    def on_rgb_unfreeze(block_idx: int) -> None:
+        start_block_warmup(block_warmups, 'RGB', block_idx, cfg.branch_warmup_epochs)
+
+    def on_rgbd_unfreeze(block_idx: int) -> None:
+        start_block_warmup(block_warmups, 'RGBD', block_idx, cfg.branch_warmup_epochs)
 
     try:
         for epoch in range(cfg.num_epochs):
@@ -449,19 +547,25 @@ def train_fusion_regressor(
                 loss_rgb = criterion(rgb_pred, y)
                 loss_rgbd = criterion(rgbd_pred, y)
                 loss_fusion = criterion(fusion_pred, y)
+                fusion_mae = torch.mean(torch.abs(fusion_pred - y))
                 loss = (
                     RGB_LOSS_WEIGHT * loss_rgb
                     + RGBD_LOSS_WEIGHT * loss_rgbd
                     + FUSION_LOSS_WEIGHT * loss_fusion
                 )
                 loss.backward()
+                apply_block_warmup_scaling(
+                    block_warmups,
+                    blocks_map,
+                    cfg.branch_warmup_scale,
+                )
                 optimizer.step()
                 if use_ema and ema_model is not None:
                     update_ema_model(ema_model, model, cfg.ema_decay)
 
                 bs = y.size(0)
                 train_sup_loss_sum += loss.item() * bs
-                train_mae_sum += loss_fusion.item() * bs
+                train_mae_sum += fusion_mae.item() * bs
                 n_train += bs
 
             model.eval()
@@ -477,6 +581,7 @@ def train_fusion_regressor(
                     loss_rgb = criterion(rgb_pred, y)
                     loss_rgbd = criterion(rgbd_pred, y)
                     loss_fusion = criterion(fusion_pred, y)
+                    fusion_mae = torch.mean(torch.abs(fusion_pred - y))
                     val_loss = (
                         RGB_LOSS_WEIGHT * loss_rgb
                         + RGBD_LOSS_WEIGHT * loss_rgbd
@@ -484,7 +589,7 @@ def train_fusion_regressor(
                     )
                     bs = y.size(0)
                     val_sup_loss_sum += val_loss.item() * bs
-                    val_mae_sum += loss_fusion.item() * bs
+                    val_mae_sum += fusion_mae.item() * bs
                     n_val += bs
 
             train_mae = train_mae_sum / max(1, n_train)
@@ -515,8 +620,30 @@ def train_fusion_regressor(
 
             scheduler.step(val_mae)
 
-            frozen_rgb = maybe_unfreeze_blocks(epoch, cfg.unfreeze_interval, frozen_rgb, rgb_blocks, 'RGB')
-            frozen_rgbd = maybe_unfreeze_blocks(epoch, cfg.unfreeze_interval, frozen_rgbd, rgbd_blocks, 'RGBD')
+            frozen_rgb, _ = maybe_unfreeze_blocks(
+                epoch,
+                rgb_interval,
+                val_history,
+                cfg.plateau_window,
+                cfg.plateau_delta,
+                frozen_rgb,
+                rgb_blocks,
+                'RGB',
+                on_rgb_unfreeze,
+            )
+            frozen_rgbd, _ = maybe_unfreeze_blocks(
+                epoch,
+                rgbd_interval,
+                val_history,
+                cfg.plateau_window,
+                cfg.plateau_delta,
+                frozen_rgbd,
+                rgbd_blocks,
+                'RGBD',
+                on_rgbd_unfreeze,
+            )
+
+            decay_block_warmups(block_warmups)
     except KeyboardInterrupt:
         interrupted = True
         print('\n[train] KeyboardInterrupt received; saving current progress...')

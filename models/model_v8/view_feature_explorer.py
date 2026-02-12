@@ -53,6 +53,8 @@ KERNEL_PATHS: Dict[str, str] = {
     'RGBD Conv1': 'rgbd_branch.features.0.conv1.0',
 }
 
+ACTIVATION_SEQUENCE: List[str] = list(ACTIVATION_PATHS.keys())
+
 FEATURE_MAPS: Dict[str, torch.Tensor] = {}
 HOOK_HANDLES: List[RemovableHandle] = []
 
@@ -95,7 +97,9 @@ def _register_activation_hooks(model: torch.nn.Module) -> None:
 
 def _tensor_to_image(tensor: torch.Tensor, channel: int | None = None, min_render_size: int = 256) -> Image.Image:
     arr = tensor.squeeze(0).detach().cpu().numpy()
-    if arr.ndim == 3:
+    if arr.ndim == 0:
+        plane = np.array([[float(arr)]], dtype=np.float32)
+    elif arr.ndim == 3:
         c, h, w = arr.shape
         use_channel = channel if channel is not None and 0 <= channel < c else None
         plane = arr[use_channel] if use_channel is not None else arr.mean(axis=0)
@@ -152,6 +156,25 @@ def _kernel_image(module: torch.nn.Conv2d, index: int) -> Tuple[Image.Image, Dic
         'shape': list(kernel.shape),
     }
     return img, stats
+
+
+def _channel_journey_images(channel_idx: int) -> List[Tuple[Image.Image, str]]:
+    channel = None if channel_idx < 0 else channel_idx
+    gallery: List[Tuple[Image.Image, str]] = []
+    for name in ACTIVATION_SEQUENCE:
+        activation = FEATURE_MAPS.get(name)
+        if activation is None:
+            img = Image.new('RGB', (64, 64), color='gray')
+            caption = f'{name}\n(missing)'
+        else:
+            img = _tensor_to_image(activation, channel)
+            stats_tensor = activation.squeeze(0).detach().cpu()
+            channel_cap = stats_tensor.shape[0] if stats_tensor.ndim >= 3 else 1
+            caption = f'{name}\nshape={list(stats_tensor.shape)}'
+            if channel is not None and channel >= channel_cap:
+                caption += ' (mean shown)'
+        gallery.append((img, caption))
+    return gallery
 
 
 # -----------------------------------------------------------------------------
@@ -237,6 +260,7 @@ def analyze_sample(
 
     kernel_module = _resolve_module(model, KERNEL_PATHS[kernel_branch])
     kernel_img, kernel_stats = _kernel_image(kernel_module, kernel_idx)
+    journey_images = _channel_journey_images(channel_idx)
 
     info = {
         'dataset_index': int(sample_idx),
@@ -256,6 +280,7 @@ def analyze_sample(
         depth_img,
         act_img,
         kernel_img,
+        journey_images,
         info,
     )
 
@@ -306,17 +331,18 @@ def main(cfg: ExplorerConfig):
         depth_view = gr.Image(label='Depth input', type='pil')
         act_view = gr.Image(label='Activation map', type='pil')
         kernel_view = gr.Image(label='Kernel heatmap', type='pil')
+        channel_gallery = gr.Gallery(label='Channel journey', columns=3)
         meta_view = gr.JSON(label='Details')
 
         run_btn.click(
             by_index,
             inputs=[idx_slider, layer_dropdown, channel_input, kernel_branch, kernel_input],
-            outputs=[idx_slider, rgb_view, depth_view, act_view, kernel_view, meta_view],
+            outputs=[idx_slider, rgb_view, depth_view, act_view, kernel_view, channel_gallery, meta_view],
         )
         id_btn.click(
             by_id,
             inputs=[id_box, layer_dropdown, channel_input, kernel_branch, kernel_input],
-            outputs=[idx_slider, rgb_view, depth_view, act_view, kernel_view, meta_view],
+            outputs=[idx_slider, rgb_view, depth_view, act_view, kernel_view, channel_gallery, meta_view],
         )
 
         def random_index(_, layer, channel, branch, kernel_idx):
@@ -326,14 +352,14 @@ def main(cfg: ExplorerConfig):
         random_btn.click(
             random_index,
             inputs=[idx_slider, layer_dropdown, channel_input, kernel_branch, kernel_input],
-            outputs=[idx_slider, rgb_view, depth_view, act_view, kernel_view, meta_view],
+            outputs=[idx_slider, rgb_view, depth_view, act_view, kernel_view, channel_gallery, meta_view],
         )
 
         # Auto-load first sample
         demo.load(
             by_index,
             inputs=[idx_slider, layer_dropdown, channel_input, kernel_branch, kernel_input],
-            outputs=[idx_slider, rgb_view, depth_view, act_view, kernel_view, meta_view],
+            outputs=[idx_slider, rgb_view, depth_view, act_view, kernel_view, channel_gallery, meta_view],
         )
 
     demo.launch()

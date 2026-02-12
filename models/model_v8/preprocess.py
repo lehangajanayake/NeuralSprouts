@@ -32,7 +32,9 @@ class PreprocessConfig:
     num_aug_per_image: int = 40
     max_center_shift: int = 20 # max pixel shift for random pre-crop translations
     seed: int = 42
-    depth_noise_std: float = 0.02  # Gaussian noise std (0-1 range) applied to depth channel
+    depth_noise_std: float = 0.03  # Gaussian noise std (0-1 range) applied to depth channel
+    depth_noise_prob: float = 0.7  # Probability of applying depth noise to a sample
+    color_jitter_prob: float = 0.8  # Probability of applying color jitter to RGB
 
     # Parallelism / speed knobs
     num_workers: Optional[int] = None  # default computed in main()
@@ -113,6 +115,21 @@ def _apply_depth_noise(depth: Image.Image, rng: np.random.RandomState, std: floa
     return Image.fromarray(depth_uint8, mode='L')
 
 
+def _maybe_apply_depth_noise(
+    depth: Image.Image,
+    rng: np.random.RandomState,
+    std: float,
+    prob: float,
+) -> Image.Image:
+    prob = float(prob)
+    if std <= 0.0 or prob <= 0.0:
+        return depth
+    prob = max(0.0, min(1.0, prob))
+    if rng.rand() > prob:
+        return depth
+    return _apply_depth_noise(depth, rng, std)
+
+
 def apply_aug(
     rgb: Image.Image,
     depth: Image.Image,
@@ -122,7 +139,7 @@ def apply_aug(
     """Apply random augmentations, keeping RGB and Depth geometrically aligned."""
 
     if T is None:
-        depth = _apply_depth_noise(depth, rng, cfg.depth_noise_std)
+        depth = _maybe_apply_depth_noise(depth, rng, cfg.depth_noise_std, cfg.depth_noise_prob)
         return rgb, depth
 
     if rng.rand() < 0.5:
@@ -139,8 +156,9 @@ def apply_aug(
         depth = T.functional.rotate(depth, angle)
 
     cj = T.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.02)
-    rgb = cj(rgb)
-    depth = _apply_depth_noise(depth, rng, cfg.depth_noise_std)
+    if rng.rand() < max(0.0, min(1.0, float(cfg.color_jitter_prob))):
+        rgb = cj(rgb)
+    depth = _maybe_apply_depth_noise(depth, rng, cfg.depth_noise_std, cfg.depth_noise_prob)
     return rgb, depth
 
 
@@ -255,6 +273,8 @@ def main(cfg: Optional[PreprocessConfig] = None) -> None:
         'max_center_shift': cfg.max_center_shift,
         'seed': cfg.seed,
         'depth_noise_std': cfg.depth_noise_std,
+        'depth_noise_prob': cfg.depth_noise_prob,
+        'color_jitter_prob': cfg.color_jitter_prob,
         'num_workers': cfg.num_workers,
         'max_items': cfg.max_items,
     }
