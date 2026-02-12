@@ -14,8 +14,8 @@ from dataloader import PlantDatasetV8
 from model import LettuceSAMFusionNet
 
 RGB_LOSS_WEIGHT = 0.2
-RGBD_LOSS_WEIGHT = 0.2
-FUSION_LOSS_WEIGHT = 0.6
+RGBD_LOSS_WEIGHT = 0.3
+FUSION_LOSS_WEIGHT = .5
 
 try:
     import matplotlib.pyplot as plt
@@ -37,16 +37,17 @@ class TrainConfig:
     scheduler_patience: int = 10
     scheduler_min_lr: float = 1e-6
 
-    val_ratio: float = 0.3
-    seed: int = 42
+    val_ratio: float = 0.1
+    seed: int = 43
     patience: int = 30
-    outputs_per_original: int = 51
-    num_folds: int = 1
+    outputs_per_original: int = 31
+    num_folds: int = 3
 
     preload_to_gpu: bool = False
     preload_device: str = 'cuda'
 
     out_dir: str = '.'
+    blacklist_ids: Tuple[int, ...] = (163,)
 
 
 def seed_everything(seed: int = 42, deterministic: bool = True):
@@ -125,6 +126,7 @@ def _build_full_dataset(cfg: TrainConfig) -> PlantDatasetV8:
         seed=cfg.seed,
         enable_cache=True,
         num_views=1,
+        blacklist_ids=cfg.blacklist_ids,
     )
     if len(dataset.df) == 0:
         raise ValueError('No samples found in augmented CSV; check preprocessing paths.')

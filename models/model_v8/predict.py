@@ -1,4 +1,5 @@
 import os
+from typing import Optional, Tuple
 
 import pandas as pd
 import torch
@@ -26,6 +27,7 @@ def predict_and_save(
     image_size: int = IMAGE_SIZE,
     output_csv: str = OUTPUT_CSV,
     batch_size: int = 64,
+    blacklist_ids: Optional[Tuple[int, ...]] = (163,),
 ):
     if not os.path.exists(test_csv):
         raise FileNotFoundError(f'Test CSV not found: {test_csv}')
@@ -37,6 +39,7 @@ def predict_and_save(
         depth_dir=test_depth,
         csv_file=test_csv,
         image_size=image_size,
+        blacklist_ids=blacklist_ids,
     )
 
     test_loader = DataLoader(

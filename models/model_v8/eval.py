@@ -1,7 +1,7 @@
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -24,12 +24,13 @@ class EvalConfig:
     rgb_dir: str = '../../datasets/Training/RGBImages'
     depth_dir: str = '../../datasets/Training/DepthImages'
 
-    checkpoint: str = 'best_model_v8.pth'
+    checkpoint: str = 'best_model_v8_fold2.pth'
     batch_size: int = 128
     seed: int = 42
     plot_path: str = 'eval_predictions_v8.png'
     errors_csv: str = 'eval_predictions_v8.csv'
-    center_crop: bool = False
+    center_crop: bool = True
+    blacklist_ids: Tuple[int, ...] = (163,)
 
 
 def seed_everything(seed: int = 42, deterministic: bool = True):
@@ -62,6 +63,7 @@ def main(cfg: Optional[EvalConfig] = None):
         augment=False,
         seed=cfg.seed,
         center_crop=cfg.center_crop,
+        blacklist_ids=cfg.blacklist_ids,
     )
     loader = DataLoader(ds, batch_size=cfg.batch_size, shuffle=False, num_workers=0)
 

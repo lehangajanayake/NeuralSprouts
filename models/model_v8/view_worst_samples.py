@@ -10,12 +10,16 @@ import os
 import random
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List
+from typing import List, Tuple
 
 import gradio as gr
 import numpy as np
 import torch
 from PIL import Image, ImageOps
+try:
+    import plotly.graph_objects as go
+except Exception:  # pragma: no cover
+    go = None
 from torch.utils.data import DataLoader
 
 from dataloader import PlantDatasetV8
@@ -33,6 +37,7 @@ class ViewerConfig:
     host: str
     port: int
     share: bool
+    blacklist_ids: Tuple[int, ...]
 
 
 def parse_args() -> ViewerConfig:
@@ -46,6 +51,7 @@ def parse_args() -> ViewerConfig:
     parser.add_argument('--host', default='127.0.0.1')
     parser.add_argument('--port', type=int, default=7870)
     parser.add_argument('--share', action='store_true')
+    parser.add_argument('--blacklist-ids', type=int, nargs='*', default=[163], help='IDs to exclude entirely.')
     args = parser.parse_args()
     return ViewerConfig(
         train_csv=args.train_csv,
@@ -57,6 +63,7 @@ def parse_args() -> ViewerConfig:
         host=args.host,
         port=args.port,
         share=args.share,
+        blacklist_ids=tuple(sorted(set(args.blacklist_ids))),
     )
 
 
@@ -68,6 +75,7 @@ def compute_worst_samples(cfg: ViewerConfig, device: torch.device):
         augment=False,
         seed=42,
         enable_cache=False,
+        blacklist_ids=cfg.blacklist_ids,
     )
     loader = DataLoader(dataset, batch_size=cfg.batch_size, shuffle=False, num_workers=0)
 
@@ -112,6 +120,50 @@ def build_viewer(entries: List[dict], cfg: ViewerConfig):
     total = len(entries)
     if total == 0:
         raise ValueError('No entries to visualize.')
+    id_to_idx = {int(e['id']): idx for idx, e in enumerate(entries)}
+
+    def make_scatter():
+        if go is None:
+            return None
+        targets = [e['target'] for e in entries]
+        preds = [e['prediction'] for e in entries]
+        errors = [e['abs_error'] for e in entries]
+        line_min = float(min(targets + preds))
+        line_max = float(max(targets + preds))
+        fig = go.Figure()
+        fig.add_trace(
+            go.Scatter(
+                x=targets,
+                y=preds,
+                mode='markers',
+                marker={
+                    'color': errors,
+                    'colorscale': 'Turbo',
+                    'showscale': True,
+                    'size': 8,
+                },
+                text=[f"ID {e['id']}" for e in entries],
+                customdata=list(range(total)),
+                hovertemplate='ID %{text}<br>Target=%{x:.2f}<br>Pred=%{y:.2f}<br>Abs err=%{marker.color:.2f}<extra></extra>',
+                name='Samples',
+            )
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=[line_min, line_max],
+                y=[line_min, line_max],
+                mode='lines',
+                line={'color': 'red', 'dash': 'dash'},
+                name='Ideal',
+            )
+        )
+        fig.update_layout(
+            title='Prediction Scatter (click point to inspect)',
+            xaxis_title='Ground truth DryWeightShoot',
+            yaxis_title='Predicted DryWeightShoot',
+            template='plotly_white',
+        )
+        return fig
 
     def _clamp_index(idx: int) -> int:
         return max(0, min(int(idx), total - 1))
@@ -140,13 +192,35 @@ def build_viewer(entries: List[dict], cfg: ViewerConfig):
     def random_idx():
         return random.randint(0, total - 1)
 
+    def fetch_by_id(sample_id: str):
+        if sample_id is None or str(sample_id).strip() == '':
+            return fetch(0)
+        try:
+            sid = int(float(sample_id))
+        except ValueError:
+            idx, rgb_img, depth_img, meta = fetch(0)
+            meta['note'] = f'Invalid ID "{sample_id}"; showing worst sample.'
+            return idx, rgb_img, depth_img, meta
+        idx_from_id = id_to_idx.get(sid)
+        if idx_from_id is None:
+            idx, rgb_img, depth_img, meta = fetch(0)
+            meta['note'] = f'ID {sid} not in top {total}; showing worst sample.'
+            return idx, rgb_img, depth_img, meta
+        return fetch(idx_from_id)
+
     with gr.Blocks(title='Worst Performing Samples — model_v8') as demo:
         gr.Markdown(
             '## model_v8 — Worst Performing Samples\n'
             'Use the slider to inspect samples with the largest absolute errors.'
         )
+        scatter_fig = make_scatter()
+        if scatter_fig is not None:
+            plot = gr.Plot(value=scatter_fig, label='Predictions vs Targets')
         slider = gr.Slider(0, total - 1, step=1, value=0, label='Rank (0 = worst)')
         rand_btn = gr.Button('Jump to random')
+        with gr.Row():
+            id_box = gr.Textbox(label='Jump to ID', placeholder='Enter image ID (e.g., 1234)')
+            go_btn = gr.Button('Go')
         with gr.Row():
             rgb_view = gr.Image(label='RGB', type='pil')
             depth_view = gr.Image(label='Depth', type='pil')
@@ -154,7 +228,27 @@ def build_viewer(entries: List[dict], cfg: ViewerConfig):
 
         slider.change(fetch, inputs=slider, outputs=[slider, rgb_view, depth_view, meta_view])
         rand_btn.click(random_idx, outputs=slider)
+        go_btn.click(fetch_by_id, inputs=id_box, outputs=[slider, rgb_view, depth_view, meta_view])
         demo.load(fetch, inputs=slider, outputs=[slider, rgb_view, depth_view, meta_view])
+        if scatter_fig is not None and hasattr(plot, 'select'):
+            def on_plot_select(evt: gr.SelectData | None):
+                if evt is None or evt.index is None:
+                    return fetch(0)
+                idx = evt.index
+                if isinstance(idx, (list, tuple)):
+                    idx = idx[0]
+                custom = None
+                if hasattr(evt, 'data') and isinstance(evt.data, dict):
+                    custom = evt.data.get('customdata')
+                if custom is None and hasattr(evt, 'value') and isinstance(evt.value, dict):
+                    custom = evt.value.get('customdata')
+                if isinstance(custom, (list, tuple)) and custom:
+                    idx = custom[0]
+                return fetch(idx)
+
+            plot.select(on_plot_select, outputs=[slider, rgb_view, depth_view, meta_view])
+        elif scatter_fig is not None:
+            gr.Markdown('**Note:** Gradio version does not support clicking the scatter plot; use the slider or random button to inspect samples.')
 
     return demo
 

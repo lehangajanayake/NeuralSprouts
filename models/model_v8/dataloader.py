@@ -5,7 +5,7 @@ variants can coexist within the repo.
 """
 
 import os
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -50,6 +50,7 @@ class PlantDatasetV8(Dataset):
         enable_cache: bool = False,
         num_views: int = 1,
         center_crop: bool = True,
+        blacklist_ids: Optional[Sequence[int]] = None,
     ):
         self.rgb_dir = rgb_dir
         self.depth_dir = depth_dir
@@ -60,6 +61,7 @@ class PlantDatasetV8(Dataset):
         self.enable_cache = bool(enable_cache)
         self.num_views = max(1, int(num_views))
         self.center_crop = bool(center_crop)
+        self.blacklist_ids = {int(x) for x in blacklist_ids} if blacklist_ids else set()
 
         self._cache: Dict[Tuple[int, int], Dict[str, torch.Tensor]] = {}
 
@@ -75,6 +77,12 @@ class PlantDatasetV8(Dataset):
         keep_rows = []
         for _, row in self.df.iterrows():
             image_id = int(row['id'])
+            if self.blacklist_ids:
+                original_id = row.get('original_id')
+                if image_id in self.blacklist_ids:
+                    continue
+                if original_id is not None and not pd.isna(original_id) and int(original_id) in self.blacklist_ids:
+                    continue
             rgb_path = os.path.join(self.rgb_dir, f"RGB_{image_id}.png")
             depth_path = os.path.join(self.depth_dir, f"Depth_{image_id}.png")
             if not (os.path.exists(rgb_path) and os.path.exists(depth_path)):
@@ -201,12 +209,14 @@ class TestPlantDatasetV8(Dataset):
         *,
         image_size: int = 96,
         center_crop: bool = True,
+        blacklist_ids: Optional[Sequence[int]] = None,
     ):
         self.rgb_dir = rgb_dir
         self.depth_dir = depth_dir
         self.csv_file = csv_file
         self.image_size = int(image_size)
         self.center_crop = bool(center_crop)
+        self.blacklist_ids = {int(x) for x in blacklist_ids} if blacklist_ids else set()
 
         df = pd.read_csv(csv_file)
         if 'image_id' in df.columns:
@@ -217,6 +227,8 @@ class TestPlantDatasetV8(Dataset):
         keep = []
         for _, row in df.iterrows():
             image_id = int(row['id'])
+            if self.blacklist_ids and image_id in self.blacklist_ids:
+                continue
             rgb_path = os.path.join(self.rgb_dir, f"RGB_{image_id}.png")
             depth_path = os.path.join(self.depth_dir, f"Depth_{image_id}.png")
             if not (os.path.exists(rgb_path) and os.path.exists(depth_path)):
