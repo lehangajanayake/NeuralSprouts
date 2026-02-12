@@ -26,7 +26,7 @@ class PreprocessConfig:
 
     image_size: int = 96
     crop_size: int = 1000  # minimum side length for random crops
-    randomize_crop: bool = True  # allow disabling random crop-size sampling
+    randomize_crop: bool = False  # allow disabling random crop-size sampling
 
     # how many augmented variants per original (not counting the original)
     num_aug_per_image: int = 30
