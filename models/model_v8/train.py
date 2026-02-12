@@ -1,5 +1,6 @@
 import os
 import random
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Sequence, Tuple
@@ -37,17 +38,18 @@ class TrainConfig:
     scheduler_patience: int = 10
     scheduler_min_lr: float = 1e-6
 
-    val_ratio: float = 0.1
+    val_ratio: float = 0.2
     seed: int = 43
-    patience: int = 30
-    outputs_per_original: int = 31
-    num_folds: int = 3
+    patience: int = 100
+    outputs_per_original: int = 21
+    num_folds: int = 1
 
-    preload_to_gpu: bool = False
+    preload_to_gpu: bool = True
     preload_device: str = 'cuda'
 
     out_dir: str = '.'
     blacklist_ids: Tuple[int, ...] = (163,)
+    best_mae_window: int = 5
 
 
 def seed_everything(seed: int = 42, deterministic: bool = True):
@@ -331,6 +333,7 @@ def train_fusion_regressor(
     best_path = str(Path(cfg.out_dir) / best_name)
     train_history: List[float] = []
     val_history: List[float] = []
+    mae_window = max(1, int(cfg.best_mae_window))
 
     for epoch in range(cfg.num_epochs):
         model.train()
@@ -389,17 +392,20 @@ def train_fusion_regressor(
         val_sup_loss = val_sup_loss_sum / max(1, n_val)
         train_history.append(train_mae)
         val_history.append(val_mae)
+        smooth_span = min(mae_window, len(val_history))
+        smooth_val_mae = float(np.mean(val_history[-smooth_span:]))
         current_lr = optimizer.param_groups[0]['lr']
         prefix = f"[train][{fold_label}]" if fold_label else '[train]'
         print(
             f"{prefix} epoch {epoch+1}/{cfg.num_epochs} lr={current_lr:.3e} "
             f"train_mae={train_mae:.4f} val_mae={val_mae:.4f} "
+            f"smoothed_val_mae({smooth_span})={smooth_val_mae:.4f} "
             f"train_loss={train_sup_loss:.4f} val_loss={val_sup_loss:.4f}"
         )
 
-        if val_mae <= stopper.best:
+        if smooth_val_mae <= stopper.best:
             save_checkpoint(best_path, model)
-        if stopper.step(val_mae):
+        if stopper.step(smooth_val_mae):
             print(f"[train] early stop at epoch {epoch+1} (best val_mae={stopper.best:.4f})")
             break
 
@@ -442,6 +448,13 @@ def main():
             print(f"  - {label}: best_val_mae={best_val:.4f} ({path})")
         avg_val = float(np.mean([val for _, _, val in fold_results]))
         print(f"Average best val MAE: {avg_val:.4f}")
+
+        best_label, best_path, best_val = min(fold_results, key=lambda x: x[2])
+        canonical_path = Path(cfg.out_dir) / 'best_model_v8.pth'
+        dest_path = str(canonical_path)
+        if os.path.abspath(best_path) != os.path.abspath(dest_path):
+            shutil.copy2(best_path, dest_path)
+            print(f"Copied best fold {best_label} checkpoint to {dest_path} (val_mae={best_val:.4f})")
     else:
         label, path, best_val = fold_results[0]
         print(f"Done. Best full model saved to: {path} (val_mae={best_val:.4f})")

@@ -175,7 +175,7 @@ class FusionMLP(nn.Module):
 class LettuceSAMFusionNet(nn.Module):
     """Dual-branch CNN with spatial attention + fusion head."""
 
-    def __init__(self, drop_path_prob: float = 0.1):
+    def __init__(self, drop_path_prob: float = 0.2):
         super().__init__()
         self.rgb_branch = RGBRegressionBranch(drop_path_prob=drop_path_prob)
         self.rgbd_branch = RGBDRegressionBranch(drop_path_prob=drop_path_prob)
