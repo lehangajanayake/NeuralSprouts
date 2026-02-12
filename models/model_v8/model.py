@@ -94,9 +94,18 @@ def _drop_rates(num_blocks: int, drop_path_prob: float) -> Tuple[float, ...]:
 class RGBRegressionBranch(nn.Module):
     """Processes RGB inputs, outputs both scalar prediction and pooled features."""
 
-    def __init__(self, in_channels: int = 3, dropout: float = 0.2, drop_path_prob: float = 0.0):
+    def __init__(
+        self,
+        in_channels: int = 3,
+        dropout: float = 0.2,
+        drop_path_prob: float = 0.0,
+        widths: Tuple[int, ...] = (24, 48, 64, 96),
+        embed_dim: int = 256,
+    ):
         super().__init__()
-        widths = (32, 64, 128, 256)
+        if not widths:
+            raise ValueError('RGBRegressionBranch requires at least one width value.')
+        self.embedding_dim = int(embed_dim)
         drops = _drop_rates(len(widths), drop_path_prob)
         layers = []
         c_in = in_channels
@@ -105,18 +114,21 @@ class RGBRegressionBranch(nn.Module):
             c_in = width
         self.features = nn.Sequential(*layers)
         self.spatial_attn = SpatialAttentionModule(kernel_size=7)
+        self.post_attn_dropout = nn.Dropout(p=dropout)
         self.global_pool = nn.AdaptiveAvgPool2d((1, 1))
+        last_width = widths[-1]
         self.embedding = nn.Sequential(
             nn.Flatten(),
-            nn.Linear(256, 256),
+            nn.Linear(last_width, self.embedding_dim),
             nn.ReLU(inplace=True),
             nn.Dropout(p=dropout),
         )
-        self.regressor = nn.Linear(256, 1)
+        self.regressor = nn.Linear(self.embedding_dim, 1)
 
     def forward(self, rgb: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         x = self.features(rgb)
         x = self.spatial_attn(x)
+        x = self.post_attn_dropout(x)
         pooled = self.global_pool(x)
         features = self.embedding(pooled)
         pred = self.regressor(features).squeeze(-1)
@@ -126,9 +138,18 @@ class RGBRegressionBranch(nn.Module):
 class RGBDRegressionBranch(nn.Module):
     """Processes RGBD inputs, outputs both scalar prediction and pooled features."""
 
-    def __init__(self, in_channels: int = 4, dropout: float = 0.2, drop_path_prob: float = 0.0):
+    def __init__(
+        self,
+        in_channels: int = 4,
+        dropout: float = 0.2,
+        drop_path_prob: float = 0.1,
+        widths: Tuple[int, ...] = (32, 64, 96, 128),
+        embed_dim: int = 256,
+    ):
         super().__init__()
-        widths = (32, 64, 128, 256)
+        if not widths:
+            raise ValueError('RGBDRegressionBranch requires at least one width value.')
+        self.embedding_dim = int(embed_dim)
         drops = _drop_rates(len(widths), drop_path_prob)
         layers = []
         c_in = in_channels
@@ -137,18 +158,21 @@ class RGBDRegressionBranch(nn.Module):
             c_in = width
         self.features = nn.Sequential(*layers)
         self.spatial_attn = SpatialAttentionModule(kernel_size=7)
+        self.post_attn_dropout = nn.Dropout(p=dropout)
         self.global_pool = nn.AdaptiveAvgPool2d((1, 1))
+        last_width = widths[-1]
         self.embedding = nn.Sequential(
             nn.Flatten(),
-            nn.Linear(256, 256),
+            nn.Linear(last_width, self.embedding_dim),
             nn.ReLU(inplace=True),
             nn.Dropout(p=dropout),
         )
-        self.regressor = nn.Linear(256, 1)
+        self.regressor = nn.Linear(self.embedding_dim, 1)
 
     def forward(self, rgbd: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         x = self.features(rgbd)
         x = self.spatial_attn(x)
+        x = self.post_attn_dropout(x)
         pooled = self.global_pool(x)
         features = self.embedding(pooled)
         pred = self.regressor(features).squeeze(-1)
@@ -175,16 +199,25 @@ class FusionMLP(nn.Module):
 class LettuceSAMFusionNet(nn.Module):
     """Dual-branch CNN with spatial attention + fusion head."""
 
-    def __init__(self, drop_path_prob: float = 0.2):
+    def __init__(
+        self,
+        drop_path_prob: float = 0.1,
+        rgb_widths: Tuple[int, ...] = (32, 64, 96, 128),
+        rgbd_widths: Tuple[int, ...] = (32, 64, 96, 128),
+        embed_dim: int = 256,
+    ):
         super().__init__()
-        self.rgb_branch = RGBRegressionBranch(drop_path_prob=drop_path_prob)
-        self.rgbd_branch = RGBDRegressionBranch(drop_path_prob=drop_path_prob)
-        self.fusion = FusionMLP(in_dim=512)
+        self.rgb_branch = RGBRegressionBranch(drop_path_prob=drop_path_prob, widths=rgb_widths, embed_dim=embed_dim)
+        self.rgbd_branch = RGBDRegressionBranch(drop_path_prob=drop_path_prob, widths=rgbd_widths, embed_dim=embed_dim)
+        fusion_in_dim = self.rgb_branch.embedding_dim + self.rgbd_branch.embedding_dim
+        self.fusion = FusionMLP(in_dim=fusion_in_dim)
+        self.fusion_in_dropout = nn.Dropout(p=0.2)
 
     def forward(self, rgb: torch.Tensor, rgbd: torch.Tensor):
         rgb_pred, rgb_feat = self.rgb_branch(rgb)
         rgbd_pred, rgbd_feat = self.rgbd_branch(rgbd)
         fusion_in = torch.cat([rgb_feat, rgbd_feat], dim=1)
+        fusion_in = self.fusion_in_dropout(fusion_in)
         fusion_pred = self.fusion(fusion_in)
         return rgb_pred, rgbd_pred, fusion_pred
 

@@ -17,6 +17,22 @@ TEST_CSV = '../../datasets/Test/Test.csv'
 MODEL_PATH = 'best_model_v8.pth'
 IMAGE_SIZE = 96
 OUTPUT_CSV = 'Test_with_predictions_v8.csv'
+DROP_PATH_PROB = 0.1
+
+
+def _infer_branch_widths(state_dict, branch_prefix: str) -> Tuple[int, ...]:
+    widths = []
+    idx = 0
+    while True:
+        key = f'{branch_prefix}.features.{idx}.conv3.1.weight'
+        tensor = state_dict.get(key)
+        if tensor is None:
+            break
+        widths.append(int(tensor.shape[0]))
+        idx += 1
+    if not widths:
+        raise ValueError(f'Unable to infer widths for {branch_prefix}; checkpoint missing expected keys.')
+    return tuple(widths)
 
 
 def predict_and_save(
@@ -28,6 +44,7 @@ def predict_and_save(
     output_csv: str = OUTPUT_CSV,
     batch_size: int = 64,
     blacklist_ids: Optional[Tuple[int, ...]] = (163,),
+    drop_path_prob: float = DROP_PATH_PROB,
 ):
     if not os.path.exists(test_csv):
         raise FileNotFoundError(f'Test CSV not found: {test_csv}')
@@ -50,8 +67,21 @@ def predict_and_save(
         pin_memory=torch.cuda.is_available(),
     )
 
-    model = LettuceSAMFusionNet().to(DEVICE)
     state = torch.load(model_path, map_location=DEVICE)
+    try:
+        rgb_widths = _infer_branch_widths(state, 'rgb_branch')
+        rgbd_widths = _infer_branch_widths(state, 'rgbd_branch')
+        print(f"[predict] inferred widths rgb={rgb_widths} rgbd={rgbd_widths}")
+    except ValueError as exc:
+        print(f"[predict] {exc} — using default widths.")
+        rgb_widths = (24, 48, 64, 96)
+        rgbd_widths = (32, 64, 96, 128)
+
+    model = LettuceSAMFusionNet(
+        drop_path_prob=drop_path_prob,
+        rgb_widths=rgb_widths,
+        rgbd_widths=rgbd_widths,
+    ).to(DEVICE)
     model.load_state_dict(state)
     model.eval()
 

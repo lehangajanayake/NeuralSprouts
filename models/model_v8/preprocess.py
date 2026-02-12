@@ -32,6 +32,7 @@ class PreprocessConfig:
     num_aug_per_image: int = 40
     max_center_shift: int = 20 # max pixel shift for random pre-crop translations
     seed: int = 42
+    depth_noise_std: float = 0.02  # Gaussian noise std (0-1 range) applied to depth channel
 
     # Parallelism / speed knobs
     num_workers: Optional[int] = None  # default computed in main()
@@ -102,10 +103,26 @@ def random_crop_size(
     return int(rng.randint(min_crop, max_crop + 1))
 
 
-def apply_aug(rgb: Image.Image, depth: Image.Image, rng: np.random.RandomState) -> Tuple[Image.Image, Image.Image]:
+def _apply_depth_noise(depth: Image.Image, rng: np.random.RandomState, std: float) -> Image.Image:
+    if std <= 0.0:
+        return depth
+    depth_np = np.asarray(depth, dtype=np.float32) / 255.0
+    noise = rng.normal(loc=0.0, scale=float(std), size=depth_np.shape).astype(np.float32)
+    depth_np = np.clip(depth_np + noise, 0.0, 1.0)
+    depth_uint8 = (depth_np * 255.0).astype(np.uint8)
+    return Image.fromarray(depth_uint8, mode='L')
+
+
+def apply_aug(
+    rgb: Image.Image,
+    depth: Image.Image,
+    rng: np.random.RandomState,
+    cfg: PreprocessConfig,
+) -> Tuple[Image.Image, Image.Image]:
     """Apply random augmentations, keeping RGB and Depth geometrically aligned."""
 
     if T is None:
+        depth = _apply_depth_noise(depth, rng, cfg.depth_noise_std)
         return rgb, depth
 
     if rng.rand() < 0.5:
@@ -123,6 +140,7 @@ def apply_aug(rgb: Image.Image, depth: Image.Image, rng: np.random.RandomState) 
 
     cj = T.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.02)
     rgb = cj(rgb)
+    depth = _apply_depth_noise(depth, rng, cfg.depth_noise_std)
     return rgb, depth
 
 
@@ -185,7 +203,7 @@ def _process_one_row(args) -> List[Dict]:
         out_id = base_out_id + 1 + k
 
         rng = np.random.RandomState(int(cfg.seed) + orig_id * 100 + k)
-        rgb_aug, depth_aug = apply_aug(rgb0, depth0, rng)
+        rgb_aug, depth_aug = apply_aug(rgb0, depth0, rng, cfg)
         shift = random_center_shift(rng, int(cfg.max_center_shift))
         rgb_aug, depth_aug = preprocess_one(rgb_aug, depth_aug, cfg, rng, shift=shift)
 
@@ -236,6 +254,7 @@ def main(cfg: Optional[PreprocessConfig] = None) -> None:
         'num_aug_per_image': cfg.num_aug_per_image,
         'max_center_shift': cfg.max_center_shift,
         'seed': cfg.seed,
+        'depth_noise_std': cfg.depth_noise_std,
         'num_workers': cfg.num_workers,
         'max_items': cfg.max_items,
     }

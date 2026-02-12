@@ -24,7 +24,8 @@ class EvalConfig:
     rgb_dir: str = '../../datasets/Training/RGBImages'
     depth_dir: str = '../../datasets/Training/DepthImages'
 
-    checkpoint: str = 'best_model_v8_fold2.pth'
+    checkpoint: str = 'best_model_v8.pth'
+    drop_path_prob: float = 0.1
     batch_size: int = 128
     seed: int = 42
     plot_path: str = 'eval_predictions_v8.png'
@@ -50,6 +51,21 @@ def seed_everything(seed: int = 42, deterministic: bool = True):
             pass
 
 
+def _infer_branch_widths(state_dict, branch_prefix: str) -> Tuple[int, ...]:
+    widths: List[int] = []
+    idx = 0
+    while True:
+        key = f'{branch_prefix}.features.{idx}.conv3.1.weight'
+        tensor = state_dict.get(key)
+        if tensor is None:
+            break
+        widths.append(int(tensor.shape[0]))
+        idx += 1
+    if not widths:
+        raise ValueError(f'Unable to infer widths for {branch_prefix}; checkpoint missing expected keys.')
+    return tuple(widths)
+
+
 def main(cfg: Optional[EvalConfig] = None):
     cfg = cfg or EvalConfig()
     seed_everything(cfg.seed, deterministic=True)
@@ -67,8 +83,21 @@ def main(cfg: Optional[EvalConfig] = None):
     )
     loader = DataLoader(ds, batch_size=cfg.batch_size, shuffle=False, num_workers=0)
 
-    model = LettuceSAMFusionNet().to(device)
     state = torch.load(cfg.checkpoint, map_location=device)
+    try:
+        rgb_widths = _infer_branch_widths(state, 'rgb_branch')
+        rgbd_widths = _infer_branch_widths(state, 'rgbd_branch')
+        print(f"[eval] inferred widths rgb={rgb_widths} rgbd={rgbd_widths}")
+    except ValueError as exc:
+        print(f"[eval] {exc} — falling back to default widths.")
+        rgb_widths = (24, 48, 64, 96)
+        rgbd_widths = (32, 64, 96, 128)
+
+    model = LettuceSAMFusionNet(
+        drop_path_prob=cfg.drop_path_prob,
+        rgb_widths=rgb_widths,
+        rgbd_widths=rgbd_widths,
+    ).to(device)
     model.load_state_dict(state)
     model.eval()
 

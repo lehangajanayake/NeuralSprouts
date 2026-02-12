@@ -45,13 +45,22 @@ class TrainConfig:
     outputs_per_original: int = 21
     num_folds: int = 1
 
-    preload_to_gpu: bool = True
+    preload_to_gpu: bool = False
     preload_device: str = 'cuda'
 
     out_dir: str = '.'
     blacklist_ids: Tuple[int, ...] = (163,)
     best_mae_window: int = 5
     ema_decay: float = 0.995
+    drop_path_prob: float = 0.1
+    rgb_widths: Tuple[int, ...] = (32, 64, 96, 128)
+    rgbd_widths: Tuple[int, ...] = (32, 64, 96, 128)
+    embed_dim: int = 256
+    mixup_alpha: float = 0.2
+    mixup_prob: float = 0.5
+    initial_frozen_rgb_blocks: int = 3
+    initial_frozen_rgbd_blocks: int = 3
+    unfreeze_interval: int = 5
 
 
 def seed_everything(seed: int = 42, deterministic: bool = True):
@@ -87,6 +96,51 @@ def update_ema_model(ema_model: nn.Module, model: nn.Module, decay: float) -> No
         # Keep buffers (e.g., BatchNorm stats) in sync
         for ema_buf, buf in zip(ema_model.buffers(), model.buffers()):
             ema_buf.copy_(buf)
+
+
+def maybe_mixup_batch(
+    rgb: torch.Tensor,
+    rgbd: torch.Tensor,
+    targets: torch.Tensor,
+    alpha: float,
+    prob: float,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if alpha <= 0.0 or prob <= 0.0:
+        return rgb, rgbd, targets
+    if torch.rand(1, device=rgb.device).item() > prob:
+        return rgb, rgbd, targets
+    lam = float(np.random.beta(alpha, alpha))
+    perm = torch.randperm(rgb.size(0), device=rgb.device)
+    rgb_mix = lam * rgb + (1.0 - lam) * rgb[perm]
+    rgbd_mix = lam * rgbd + (1.0 - lam) * rgbd[perm]
+    targets_mix = lam * targets + (1.0 - lam) * targets[perm]
+    return rgb_mix, rgbd_mix, targets_mix
+
+
+def apply_block_freezing(blocks: Sequence[nn.Module], frozen_count: int) -> None:
+    frozen = max(0, min(int(frozen_count), len(blocks)))
+    for idx, block in enumerate(blocks):
+        requires = idx >= frozen
+        for param in block.parameters():
+            param.requires_grad = requires
+
+
+def maybe_unfreeze_blocks(
+    epoch: int,
+    interval: int,
+    current_frozen: int,
+    blocks: Sequence[nn.Module],
+    branch_name: str,
+) -> int:
+    if interval <= 0 or current_frozen <= 0:
+        return current_frozen
+    if (epoch + 1) % interval != 0:
+        return current_frozen
+    new_frozen = max(0, current_frozen - 1)
+    if new_frozen != current_frozen:
+        apply_block_freezing(blocks, new_frozen)
+        print(f"[train] unfreezing {branch_name} block index {new_frozen}")
+    return new_frozen
 
 
 class TensorDictDataset(Dataset):
@@ -143,10 +197,10 @@ def _build_full_dataset(cfg: TrainConfig) -> PlantDatasetV8:
         cfg.rgb_dir,
         cfg.depth_dir,
         cfg.train_csv,
-        augment=False,
+        augment=True,
         seed=cfg.seed,
         enable_cache=True,
-        num_views=1,
+        num_views=3,
         blacklist_ids=cfg.blacklist_ids,
     )
     if len(dataset.df) == 0:
@@ -304,7 +358,7 @@ def save_checkpoint(path: str, model: nn.Module):
     torch.save(model.state_dict(), path)
 
 
-def save_training_curves(train_history: List[float], val_history: List[float], out_dir: str, suffix: str = '') -> None:
+def save_training_curves(train_history: List[float], val_history: List[float], out_dir: str, suffix: str = '', best_epoch: int | None = None) -> None:
     if not train_history or not val_history:
         return
     if plt is None:
@@ -323,7 +377,11 @@ def save_training_curves(train_history: List[float], val_history: List[float], o
 
     out_name = f'training_curves{suffix}.png' if suffix else 'training_curves.png'
     out_path = Path(out_dir) / out_name
-    fig.savefig(out_path, dpi=150, bbox_inches='tight')
+    if best_epoch is not None and 1 <= best_epoch <= len(train_history):
+        best_val = val_history[best_epoch - 1]
+        ax.scatter([best_epoch], [best_val], color='red', s=40, label=f'Best epoch {best_epoch}')
+        ax.legend()
+        fig.savefig(out_path, dpi=150, bbox_inches='tight')
     plt.close(fig)
     print(f'Saved training curves to: {out_path}')
 
@@ -360,7 +418,19 @@ def train_fusion_regressor(
         for param in ema_model.parameters():
             param.requires_grad_(False)
     best_saved = False
+    best_epoch_index: int | None = None
     interrupted = False
+    rgb_blocks = list(model.rgb_branch.features)
+    rgbd_blocks = list(model.rgbd_branch.features)
+    frozen_rgb = min(cfg.initial_frozen_rgb_blocks, len(rgb_blocks))
+    frozen_rgbd = min(cfg.initial_frozen_rgbd_blocks, len(rgbd_blocks))
+    if frozen_rgb > 0:
+        apply_block_freezing(rgb_blocks, frozen_rgb)
+        print(f"[train] freezing first {frozen_rgb} RGB blocks")
+    if frozen_rgbd > 0:
+        apply_block_freezing(rgbd_blocks, frozen_rgbd)
+        print(f"[train] freezing first {frozen_rgbd} RGBD blocks")
+
     try:
         for epoch in range(cfg.num_epochs):
             model.train()
@@ -371,6 +441,8 @@ def train_fusion_regressor(
                 rgb = batch['rgb'].to(device, non_blocking=True)
                 rgbd = batch['rgbd'].to(device, non_blocking=True)
                 y = batch['dry_weight'].to(device, non_blocking=True)
+
+                rgb, rgbd, y = maybe_mixup_batch(rgb, rgbd, y, cfg.mixup_alpha, cfg.mixup_prob)
 
                 optimizer.zero_grad(set_to_none=True)
                 rgb_pred, rgbd_pred, fusion_pred = model(rgb, rgbd)
@@ -436,14 +508,21 @@ def train_fusion_regressor(
                 target = ema_model if use_ema and ema_model is not None else model
                 save_checkpoint(best_path, target)
                 best_saved = True
+                best_epoch_index = epoch + 1
             if stopper.step(smooth_val_mae):
                 print(f"[train] early stop at epoch {epoch+1} (best val_mae={stopper.best:.4f})")
                 break
 
             scheduler.step(val_mae)
+
+            frozen_rgb = maybe_unfreeze_blocks(epoch, cfg.unfreeze_interval, frozen_rgb, rgb_blocks, 'RGB')
+            frozen_rgbd = maybe_unfreeze_blocks(epoch, cfg.unfreeze_interval, frozen_rgbd, rgbd_blocks, 'RGBD')
     except KeyboardInterrupt:
         interrupted = True
         print('\n[train] KeyboardInterrupt received; saving current progress...')
+        target = ema_model if use_ema and ema_model is not None else model
+        save_checkpoint(best_path, target)
+        best_saved = True
 
     target = ema_model if use_ema and ema_model is not None else model
     if not best_saved or not os.path.exists(best_path):
@@ -451,7 +530,7 @@ def train_fusion_regressor(
         best_saved = True
     if interrupted:
         print(f"[train] interrupted — best checkpoint saved to {best_path}")
-    return best_path, train_history, val_history, stopper.best
+    return best_path, train_history, val_history, stopper.best, best_epoch_index
 
 
 def main():
@@ -467,9 +546,14 @@ def main():
 
     for fold_idx, (train_loader, val_loader, label) in enumerate(fold_loaders, 1):
         fold_suffix = f'_{label}' if total_folds > 1 else ''
-        model = LettuceSAMFusionNet().to(device)
+        model = LettuceSAMFusionNet(
+            drop_path_prob=cfg.drop_path_prob,
+            rgb_widths=cfg.rgb_widths,
+            rgbd_widths=cfg.rgbd_widths,
+            embed_dim=cfg.embed_dim,
+        ).to(device)
         print(f"[train] training fusion regressor ({label})...")
-        best_full, train_hist, val_hist, best_val = train_fusion_regressor(
+        best_full, train_hist, val_hist, best_val, best_epoch = train_fusion_regressor(
             cfg,
             model,
             train_loader,
@@ -478,7 +562,7 @@ def main():
             fold_suffix=fold_suffix,
             fold_label=label,
         )
-        save_training_curves(train_hist, val_hist, cfg.out_dir, suffix=fold_suffix)
+        save_training_curves(train_hist, val_hist, cfg.out_dir, suffix=fold_suffix, best_epoch=best_epoch)
         fold_results.append((label, best_full, best_val))
         print(f"[train] fold {label} best checkpoint: {best_full} (val_mae={best_val:.4f})")
 

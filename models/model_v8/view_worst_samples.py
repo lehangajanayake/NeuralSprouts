@@ -67,6 +67,21 @@ def parse_args() -> ViewerConfig:
     )
 
 
+def _infer_branch_widths(state_dict, branch_prefix: str) -> Tuple[int, ...]:
+    widths: List[int] = []
+    idx = 0
+    while True:
+        key = f'{branch_prefix}.features.{idx}.conv3.1.weight'
+        tensor = state_dict.get(key)
+        if tensor is None:
+            break
+        widths.append(int(tensor.shape[0]))
+        idx += 1
+    if not widths:
+        raise ValueError(f'Unable to infer widths for {branch_prefix}; checkpoint missing expected keys.')
+    return tuple(widths)
+
+
 def compute_worst_samples(cfg: ViewerConfig, device: torch.device):
     dataset = PlantDatasetV8(
         cfg.rgb_dir,
@@ -79,8 +94,20 @@ def compute_worst_samples(cfg: ViewerConfig, device: torch.device):
     )
     loader = DataLoader(dataset, batch_size=cfg.batch_size, shuffle=False, num_workers=0)
 
-    model = LettuceSAMFusionNet().to(device)
     state = torch.load(cfg.checkpoint, map_location=device)
+    try:
+        rgb_widths = _infer_branch_widths(state, 'rgb_branch')
+        rgbd_widths = _infer_branch_widths(state, 'rgbd_branch')
+        print(f"[viewer] inferred widths rgb={rgb_widths} rgbd={rgbd_widths}")
+    except ValueError as exc:
+        print(f"[viewer] {exc} — falling back to defaults.")
+        rgb_widths = (24, 48, 64, 96)
+        rgbd_widths = (32, 64, 96, 128)
+
+    model = LettuceSAMFusionNet(
+        rgb_widths=rgb_widths,
+        rgbd_widths=rgbd_widths,
+    ).to(device)
     model.load_state_dict(state)
     model.eval()
 
