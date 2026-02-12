@@ -49,6 +49,7 @@ class PlantDatasetV8(Dataset):
         seed: int = 42,
         enable_cache: bool = False,
         num_views: int = 1,
+        center_crop: bool = True,
     ):
         self.rgb_dir = rgb_dir
         self.depth_dir = depth_dir
@@ -58,6 +59,7 @@ class PlantDatasetV8(Dataset):
         self.seed = int(seed)
         self.enable_cache = bool(enable_cache)
         self.num_views = max(1, int(num_views))
+        self.center_crop = bool(center_crop)
 
         self._cache: Dict[Tuple[int, int], Dict[str, torch.Tensor]] = {}
 
@@ -142,8 +144,9 @@ class PlantDatasetV8(Dataset):
         rgb = Image.open(row['rgb_path']).convert('RGB')
         depth = Image.open(row['depth_path']).convert('L')
 
-        rgb = _center_crop(rgb)
-        depth = _center_crop(depth)
+        if self.center_crop:
+            rgb = _center_crop(rgb)
+            depth = _center_crop(depth)
         rgb, depth = self._maybe_aug(rgb, depth, base_idx, view_idx)
 
         if self.resize is not None:
@@ -197,11 +200,13 @@ class TestPlantDatasetV8(Dataset):
         csv_file: str,
         *,
         image_size: int = 96,
+        center_crop: bool = True,
     ):
         self.rgb_dir = rgb_dir
         self.depth_dir = depth_dir
         self.csv_file = csv_file
         self.image_size = int(image_size)
+        self.center_crop = bool(center_crop)
 
         df = pd.read_csv(csv_file)
         if 'image_id' in df.columns:
@@ -234,8 +239,9 @@ class TestPlantDatasetV8(Dataset):
         rgb = Image.open(row['rgb_path']).convert('RGB')
         depth = Image.open(row['depth_path']).convert('L')
 
-        rgb = _center_crop(rgb)
-        depth = _center_crop(depth)
+        if self.center_crop:
+            rgb = _center_crop(rgb)
+            depth = _center_crop(depth)
 
         if self.resize is not None:
             rgb = self.resize(rgb)

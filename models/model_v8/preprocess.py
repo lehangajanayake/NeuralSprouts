@@ -26,6 +26,7 @@ class PreprocessConfig:
 
     image_size: int = 96
     crop_size: int = 1000  # minimum side length for random crops
+    randomize_crop: bool = True  # allow disabling random crop-size sampling
 
     # how many augmented variants per original (not counting the original)
     num_aug_per_image: int = 30
@@ -94,6 +95,8 @@ def random_crop_size(
 
     max_crop = min(min(rgb.size), min(depth.size))
     min_crop = min(int(cfg.crop_size), max_crop)
+    if not cfg.randomize_crop:
+        return min_crop
     if min_crop >= max_crop:
         return max_crop
     return int(rng.randint(min_crop, max_crop + 1))
@@ -229,6 +232,7 @@ def main(cfg: Optional[PreprocessConfig] = None) -> None:
         'out_csv': cfg.out_csv,
         'image_size': cfg.image_size,
         'crop_size': cfg.crop_size,
+        'randomize_crop': cfg.randomize_crop,
         'num_aug_per_image': cfg.num_aug_per_image,
         'max_center_shift': cfg.max_center_shift,
         'seed': cfg.seed,

@@ -29,6 +29,7 @@ class EvalConfig:
     seed: int = 42
     plot_path: str = 'eval_predictions_v8.png'
     errors_csv: str = 'eval_predictions_v8.csv'
+    center_crop: bool = False
 
 
 def seed_everything(seed: int = 42, deterministic: bool = True):
@@ -54,7 +55,14 @@ def main(cfg: Optional[EvalConfig] = None):
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-    ds = PlantDatasetV8(cfg.rgb_dir, cfg.depth_dir, cfg.csv_path, augment=False, seed=cfg.seed)
+    ds = PlantDatasetV8(
+        cfg.rgb_dir,
+        cfg.depth_dir,
+        cfg.csv_path,
+        augment=False,
+        seed=cfg.seed,
+        center_crop=cfg.center_crop,
+    )
     loader = DataLoader(ds, batch_size=cfg.batch_size, shuffle=False, num_workers=0)
 
     model = LettuceSAMFusionNet().to(device)
