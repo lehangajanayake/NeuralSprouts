@@ -213,5 +213,11 @@ __marimo__/
 
 # Ignore augmented dataset and predictions
 /datasets/Training/Augmented/
+/datasets/Training/AugmentedMixup/
 /datasets/Test/Augmented/
+/datasets/Training/Augmented_v8
+/datasets/Training/Augmented_v9
 Test_with_predictions.csv
+
+
+models/model_v6/datasets/*
