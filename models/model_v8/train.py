@@ -31,7 +31,7 @@ class TrainConfig:
     rgb_dir: str = '../../datasets/Training/Augmented_v8/RGBImages'
     depth_dir: str = '../../datasets/Training/Augmented_v8/DepthImages'
 
-    batch_size: int = 32
+    batch_size: int = 128
     num_epochs: int = 100
     lr: float = 1e-3
     weight_decay: float = 1e-5
@@ -45,7 +45,7 @@ class TrainConfig:
     outputs_per_original: int = 41
     num_folds: int = 1
     group_by_original: bool = True
-    val_only_originals: bool = True
+    val_only_originals: bool = False
 
     preload_to_gpu: bool = True
     preload_device: str = 'cuda'
@@ -269,6 +269,16 @@ def decay_block_warmups(tracker: Dict[Tuple[str, int], Dict[str, int]]) -> None:
             to_remove.append(key)
     for key in to_remove:
         tracker.pop(key, None)
+
+
+def _create_scheduler(optimizer: optim.Optimizer, cfg: TrainConfig):
+    return optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        mode='min',
+        factor=cfg.scheduler_factor,
+        patience=cfg.scheduler_patience,
+        min_lr=cfg.scheduler_min_lr,
+    )
 
 
 class TensorDictDataset(Dataset):
@@ -555,13 +565,7 @@ def train_fusion_regressor(
     else:
         criterion = nn.L1Loss()
     optimizer = optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer,
-        mode='min',
-        factor=cfg.scheduler_factor,
-        patience=cfg.scheduler_patience,
-        min_lr=cfg.scheduler_min_lr,
-    )
+    scheduler = _create_scheduler(optimizer, cfg)
     stopper = EarlyStopper(cfg.patience)
 
     best_name = f'best_model_v8{fold_suffix}.pth' if fold_suffix else 'best_model_v8.pth'
@@ -602,9 +606,10 @@ def train_fusion_regressor(
 
     try:
         for epoch in range(cfg.num_epochs):
+            reset_scheduler = False
             # Recompute freezing schedule before training so newly unfrozen blocks
             # participate in the current epoch instead of waiting one more.
-            frozen_rgb, _ = maybe_unfreeze_blocks(
+            frozen_rgb, rgb_unfrozen_idx = maybe_unfreeze_blocks(
                 epoch,
                 cfg.unfreeze_start_epoch,
                 rgb_interval,
@@ -613,7 +618,9 @@ def train_fusion_regressor(
                 'RGB',
                 on_rgb_unfreeze,
             )
-            frozen_rgbd, _ = maybe_unfreeze_blocks(
+            if rgb_unfrozen_idx is not None:
+                reset_scheduler = True
+            frozen_rgbd, rgbd_unfrozen_idx = maybe_unfreeze_blocks(
                 epoch,
                 cfg.unfreeze_start_epoch,
                 rgbd_interval,
@@ -622,6 +629,13 @@ def train_fusion_regressor(
                 'RGBD',
                 on_rgbd_unfreeze,
             )
+            if rgbd_unfrozen_idx is not None:
+                reset_scheduler = True
+            if reset_scheduler:
+                for group in optimizer.param_groups:
+                    group['lr'] = cfg.lr
+                scheduler = _create_scheduler(optimizer, cfg)
+                print('[train] scheduler reset to base LR due to block unfreeze')
             model.train()
             train_mae_sum, n_train = 0.0, 0
             train_sup_loss_sum = 0.0
