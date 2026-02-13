@@ -32,7 +32,7 @@ class TrainConfig:
     depth_dir: str = '../../datasets/Training/Augmented_v8/DepthImages'
 
     batch_size: int = 256
-    num_epochs: int = 50
+    num_epochs: int = 100
     lr: float = 1e-3
     weight_decay: float = 1e-4
     scheduler_factor: float = 0.5
@@ -64,10 +64,10 @@ class TrainConfig:
     unfreeze_interval: int = 5
     rgb_unfreeze_interval: int = 5
     rgbd_unfreeze_interval: int = 7
-    unfreeze_start_epoch: int = 15
+    unfreeze_start_epoch: int =7
     branch_warmup_epochs: int = 2
     branch_warmup_scale: float = 0.3
-    huber_delta: float = 0.4
+    huber_delta: float = 0.3
 
 
 def seed_everything(seed: int = 42, deterministic: bool = True):
@@ -524,6 +524,26 @@ def train_fusion_regressor(
 
     try:
         for epoch in range(cfg.num_epochs):
+            # Recompute freezing schedule before training so newly unfrozen blocks
+            # participate in the current epoch instead of waiting one more.
+            frozen_rgb, _ = maybe_unfreeze_blocks(
+                epoch,
+                cfg.unfreeze_start_epoch,
+                rgb_interval,
+                frozen_rgb,
+                rgb_blocks,
+                'RGB',
+                on_rgb_unfreeze,
+            )
+            frozen_rgbd, _ = maybe_unfreeze_blocks(
+                epoch,
+                cfg.unfreeze_start_epoch,
+                rgbd_interval,
+                frozen_rgbd,
+                rgbd_blocks,
+                'RGBD',
+                on_rgbd_unfreeze,
+            )
             model.train()
             train_mae_sum, n_train = 0.0, 0
             train_sup_loss_sum = 0.0
@@ -612,26 +632,6 @@ def train_fusion_regressor(
                 break
 
             scheduler.step(val_mae)
-
-            frozen_rgb, _ = maybe_unfreeze_blocks(
-                epoch,
-                cfg.unfreeze_start_epoch,
-                rgb_interval,
-                frozen_rgb,
-                rgb_blocks,
-                'RGB',
-                on_rgb_unfreeze,
-            )
-            frozen_rgbd, _ = maybe_unfreeze_blocks(
-                epoch,
-                cfg.unfreeze_start_epoch,
-                rgbd_interval,
-                frozen_rgbd,
-                rgbd_blocks,
-                'RGBD',
-                on_rgbd_unfreeze,
-            )
-
             decay_block_warmups(block_warmups)
     except KeyboardInterrupt:
         interrupted = True

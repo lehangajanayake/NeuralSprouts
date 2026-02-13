@@ -75,7 +75,7 @@ def predict_and_save(
     except ValueError as exc:
         print(f"[predict] {exc} — using default widths.")
         rgb_widths = (24, 48, 64, 96)
-        rgbd_widths = (32, 64, 96, 128)
+        rgbd_widths = (48, 96, 144, 192)
 
     model = LettuceSAMFusionNet(
         drop_path_prob=drop_path_prob,
