@@ -63,13 +63,18 @@ class PreprocessConfig:
     image_size: int = 96
     crop_size: int = 1000
     randomize_crop: bool = False
-    max_center_shift: int = 50
+    max_center_shift: int = 80
 
     # ---- augmentation -----------------------------------------------------
     num_aug_per_image: int = 45
-    depth_noise_std: float = 0.03
-    depth_noise_prob: float = 0.7
-    color_jitter_prob: float = 0.8
+    depth_noise_std: float = 0.05
+    depth_noise_prob: float = 0.8
+    color_jitter_prob: float = 0.9
+    gaussian_blur_prob: float = 0.3
+    random_scale_range: Tuple[float, float] = (0.75, 1.25)
+    random_scale_prob: float = 0.5
+    random_affine_prob: float = 0.4
+    random_erasing_prob: float = 0.3
 
     # ---- sharding ---------------------------------------------------------
     shard_size: int = 256  # samples per .pt file
@@ -149,6 +154,7 @@ def _apply_augmentations(
     if T is None or TF is None:
         return rgb, depth
 
+    # --- geometric (applied to both rgb and depth) ---
     if rng.rand() < 0.5:
         rgb, depth = TF.hflip(rgb), TF.hflip(depth)
     if rng.rand() < 0.5:
@@ -156,8 +162,39 @@ def _apply_augmentations(
     k = int(rng.randint(0, 4))
     if k:
         rgb, depth = TF.rotate(rgb, 90 * k), TF.rotate(depth, 90 * k)
+
+    # Random affine (small shear + translate) for pose diversity
+    if rng.rand() < cfg.random_affine_prob:
+        angle = float(rng.uniform(-15, 15))
+        shear = float(rng.uniform(-10, 10))
+        tx = float(rng.uniform(-0.05, 0.05))
+        ty = float(rng.uniform(-0.05, 0.05))
+        w, h = rgb.size
+        translate = (int(tx * w), int(ty * h))
+        rgb = TF.affine(rgb, angle=angle, translate=translate, scale=1.0, shear=shear)
+        depth = TF.affine(depth, angle=angle, translate=translate, scale=1.0, shear=shear)
+
+    # Random scale — resize then crop back to original size
+    if rng.rand() < cfg.random_scale_prob:
+        lo, hi = cfg.random_scale_range
+        scale = float(rng.uniform(lo, hi))
+        w, h = rgb.size
+        new_w, new_h = int(w * scale), int(h * scale)
+        if new_w > 10 and new_h > 10:
+            rgb = rgb.resize((new_w, new_h), Image.BILINEAR)
+            depth = depth.resize((new_w, new_h), Image.BILINEAR)
+
+    # --- photometric (rgb only) ---
     if rng.rand() < max(0.0, min(1.0, cfg.color_jitter_prob)):
-        rgb = T.ColorJitter(0.3, 0.3, 0.3, 0.03)(rgb)
+        rgb = T.ColorJitter(0.4, 0.4, 0.3, 0.05)(rgb)
+
+    # Gaussian blur
+    if rng.rand() < cfg.gaussian_blur_prob:
+        radius = float(rng.uniform(0.5, 1.5))
+        from PIL import ImageFilter
+        rgb = rgb.filter(ImageFilter.GaussianBlur(radius=radius))
+
+    # --- depth noise ---
     if cfg.depth_noise_std > 0 and rng.rand() < cfg.depth_noise_prob:
         depth = _apply_depth_noise(depth, rng, cfg.depth_noise_std)
     return rgb, depth
@@ -238,6 +275,15 @@ def _process_one_original(args) -> List[Dict]:
         rgb_a, depth_a = _apply_augmentations(rgb0, depth0, rng_k, cfg)
         rgb_a, depth_a = _crop_and_resize(rgb_a, depth_a, cfg, rng_k)
         rgb_t, rgbd_t = _to_tensors(rgb_a, depth_a)
+        # Random erasing (cutout) — masks a random rectangle with zeros
+        if cfg.random_erasing_prob > 0 and rng_k.rand() < cfg.random_erasing_prob:
+            _, h, w = rgb_t.shape
+            eh = int(rng_k.randint(h // 8, h // 3 + 1))
+            ew = int(rng_k.randint(w // 8, w // 3 + 1))
+            ey = int(rng_k.randint(0, h - eh + 1))
+            ex = int(rng_k.randint(0, w - ew + 1))
+            rgb_t[:, ey:ey + eh, ex:ex + ew] = 0.0
+            rgbd_t[:, ey:ey + eh, ex:ex + ew] = 0.0
         results.append(
             {"rgb": rgb_t, "rgbd": rgbd_t, "target": target, "id": orig_id, "original_id": orig_id}
         )

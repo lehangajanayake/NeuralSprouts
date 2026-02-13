@@ -85,7 +85,7 @@ class TrainConfig:
 
     # ---- architecture -----------------------------------------------------
     drop_path_prob: float = 0.15
-    rgb_widths: Tuple[int, ...] = (8, 16, 32, 64)
+    rgb_widths: Tuple[int, ...] = (16, 32, 48, 64)
     rgbd_widths: Tuple[int, ...] = (16, 32, 64, 96)
     embed_dim: int = 64
 
