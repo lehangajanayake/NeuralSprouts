@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
+import pandas as pd
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -74,6 +75,8 @@ class TrainConfig:
     onecycle_final_div_factor: float = 1e4 # final_lr  = initial_lr / final_div_factor
 
     # ---- split / fold -----------------------------------------------------
+    labels_csv: str = "../../datasets/Training/Train.csv"  # for variety + weight info
+    val_per_cell: int = 3  # original images per (variety × weight-regime) cell in val
     val_ratio: float = 0.2
     seed: int = 43
     patience: int = 100
@@ -81,10 +84,10 @@ class TrainConfig:
     group_by_original: bool = True
 
     # ---- architecture -----------------------------------------------------
-    drop_path_prob: float = 0.1
-    rgb_widths: Tuple[int, ...] = (32, 64, 96, 128)
-    rgbd_widths: Tuple[int, ...] = (32, 64, 96, 128)
-    embed_dim: int = 256
+    drop_path_prob: float = 0.15
+    rgb_widths: Tuple[int, ...] = (8, 16, 32, 64)
+    rgbd_widths: Tuple[int, ...] = (16, 32, 64, 96)
+    embed_dim: int = 64 + 96
 
     # ---- regularisation ---------------------------------------------------
     mixup_alpha: float = 0.2
@@ -233,32 +236,91 @@ def _split_by_group(
     original_ids: np.ndarray,
     cfg: TrainConfig,
 ) -> List[Tuple[List[int], List[int]]]:
-    """Group-aware train/val split (or K-fold) preserving original_id boundaries."""
-    unique = np.unique(original_ids)
+    """Stratified train/val split ensuring every (variety × weight-regime)
+    cell is represented in the validation set.
+
+    Steps
+    -----
+    1. Read *labels_csv* to obtain ``Variety`` and ``DryWeightShoot`` for
+       each original ``image_id``.
+    2. Split originals into three weight regimes (low / mid / high) using
+       the 33rd and 67th percentile of ``DryWeightShoot``.
+    3. For each of the 4 varieties × 3 regimes = 12 cells, randomly select
+       ``val_per_cell`` originals for validation.
+    4. Every augmented copy of a selected original goes to val; the rest
+       go to train.
+
+    This guarantees that the validation set always covers all varieties
+    and the full range of dry-weight values.
+    """
+    # --- load metadata ---------------------------------------------------
+    csv_path = Path(cfg.labels_csv)
+    if not csv_path.is_file():
+        raise FileNotFoundError(
+            f"labels_csv not found: {csv_path}  (needed for stratified split)"
+        )
+    meta = pd.read_csv(csv_path)
+
+    # Remove blacklisted
+    if cfg.blacklist_ids:
+        meta = meta[~meta["image_id"].isin(cfg.blacklist_ids)]
+
+    # Restrict to originals actually present in the shard dataset
+    unique_in_ds = set(int(x) for x in np.unique(original_ids))
+    meta = meta[meta["image_id"].isin(unique_in_ds)].copy()
+
+    # --- assign weight regime --------------------------------------------
+    q33 = float(meta["DryWeightShoot"].quantile(0.333))
+    q67 = float(meta["DryWeightShoot"].quantile(0.667))
+
+    def _regime(w: float) -> str:
+        if w <= q33:
+            return "low"
+        elif w <= q67:
+            return "mid"
+        return "high"
+
+    meta["regime"] = meta["DryWeightShoot"].apply(_regime)
+
+    # --- stratified selection --------------------------------------------
     rng = np.random.RandomState(cfg.seed)
-    rng.shuffle(unique)
-    n_folds = max(1, min(cfg.num_folds, len(unique)))
+    val_originals: set[int] = set()
 
-    splits: List[Tuple[List[int], List[int]]] = []
-    if n_folds > 1:
-        fold_groups = np.array_split(unique, n_folds)
-        for val_groups in fold_groups:
-            val_set = set(int(g) for g in val_groups)
-            train_idx = [i for i, g in enumerate(original_ids) if g not in val_set]
-            val_idx = [i for i, g in enumerate(original_ids) if g in val_set]
-            if train_idx and val_idx:
-                splits.append((train_idx, val_idx))
-    else:
-        n_val = max(1, int(round(len(unique) * cfg.val_ratio)))
-        val_set = set(int(g) for g in unique[:n_val])
-        train_idx = [i for i, g in enumerate(original_ids) if g not in val_set]
-        val_idx = [i for i, g in enumerate(original_ids) if g in val_set]
-        if train_idx and val_idx:
-            splits.append((train_idx, val_idx))
+    for _variety in sorted(meta["Variety"].unique()):
+        for _regime in ["low", "mid", "high"]:
+            cell = meta[(meta["Variety"] == _variety) & (meta["regime"] == _regime)]
+            ids_in_cell = cell["image_id"].values.copy()
+            rng.shuffle(ids_in_cell)
+            n_pick = min(cfg.val_per_cell, len(ids_in_cell))
+            if n_pick == 0:
+                print(
+                    f"  [split] WARNING: no originals for {_variety}/{_regime}"
+                )
+                continue
+            for oid in ids_in_cell[:n_pick]:
+                val_originals.add(int(oid))
 
-    if not splits:
-        raise ValueError("Could not create any train/val split. Check your data.")
-    return splits
+    # --- map back to shard indices ---------------------------------------
+    train_idx = [i for i, g in enumerate(original_ids) if int(g) not in val_originals]
+    val_idx = [i for i, g in enumerate(original_ids) if int(g) in val_originals]
+
+    n_val_orig = len(val_originals)
+    n_train_orig = len(unique_in_ds) - n_val_orig
+    print(
+        f"  [split] stratified: {n_val_orig} val originals "
+        f"({len(val_idx)} samples) / {n_train_orig} train originals "
+        f"({len(train_idx)} samples)"
+    )
+    print(
+        f"  [split] weight terciles: low <= {q33:.2f} | mid <= {q67:.2f} | high > {q67:.2f}"
+    )
+
+    if not train_idx or not val_idx:
+        raise ValueError(
+            "Stratified split produced an empty train or val set. "
+            "Lower val_per_cell or check your data."
+        )
+    return [(train_idx, val_idx)]
 
 
 # ---------------------------------------------------------------------------
@@ -374,7 +436,9 @@ def _train_one_fold(  # noqa: C901
     train_hist: List[float] = []
     val_hist: List[float] = []
     best_epoch: Optional[int] = None
+    best_smooth: float = float("inf")  # dedicated tracker — independent of early stopper
     accum = max(1, cfg.grad_accum_steps)
+    curves_suffix = fold_suffix
 
     def _on_rgb_unfreeze(idx: int) -> None:
         _start_warmup(warmups, "RGB", idx, cfg.branch_warmup_epochs)
@@ -462,14 +526,22 @@ def _train_one_fold(  # noqa: C901
                 f"smooth({span})={smooth:.4f}"
             )
 
-            if smooth <= stopper.best:
+            # Save checkpoint only on strict improvement
+            if smooth < best_smooth:
+                best_smooth = smooth
                 target = ema_model if use_ema and ema_model is not None else model
                 _save(best_path, target)
                 best_epoch = epoch + 1
+                print(f"    ★ saved best model (smooth={smooth:.4f})")
 
             if stopper.step(smooth):
-                print(f"  early stop at epoch {epoch+1} (best={stopper.best:.4f})")
+                print(f"  early stop at epoch {epoch+1} (best_smooth={best_smooth:.4f})")
                 break
+
+            # Save curves periodically so progress is visible during training
+            if (epoch + 1) % 5 == 0 or (epoch + 1) == cfg.num_epochs:
+                _save_curves(train_hist, val_hist, cfg.out_dir,
+                             suffix=curves_suffix, best_ep=best_epoch)
 
             _tick_warmups(warmups)
 
@@ -483,7 +555,11 @@ def _train_one_fold(  # noqa: C901
         target = ema_model if use_ema and ema_model is not None else model
         _save(best_path, target)
 
-    return best_path, train_hist, val_hist, stopper.best, best_epoch
+    # Always save final curves (covers normal end, early stop, and Ctrl+C)
+    _save_curves(train_hist, val_hist, cfg.out_dir,
+                 suffix=curves_suffix, best_ep=best_epoch)
+
+    return best_path, train_hist, val_hist, best_smooth, best_epoch
 
 
 # ---------------------------------------------------------------------------
@@ -556,7 +632,7 @@ def main() -> None:
             cfg, model, train_loader, val_loader, device,
             fold_suffix=suffix, fold_label=label,
         )
-        _save_curves(t_hist, v_hist, cfg.out_dir, suffix=suffix, best_ep=best_ep)
+        # Curves are already saved inside _train_one_fold (periodically + at end)
         results.append((label, best_path, best_val))
         print(f"  {label} done → {best_path}  best_val_mae={best_val:.4f}")
 
