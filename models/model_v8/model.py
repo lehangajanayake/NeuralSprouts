@@ -32,7 +32,7 @@ class BottleneckBlock(nn.Module):
             nn.ReLU(inplace=True),
         )
         self.conv2 = nn.Sequential(
-            nn.Conv2d(mid_ch, mid_ch, kernel_size=5, padding=2, bias=False),
+            nn.Conv2d(mid_ch, mid_ch, kernel_size=3, padding=1, bias=False),
             nn.BatchNorm2d(mid_ch),
             nn.ReLU(inplace=True),
         )

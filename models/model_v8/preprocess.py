@@ -29,7 +29,7 @@ class PreprocessConfig:
     randomize_crop: bool = False  # allow disabling random crop-size sampling
 
     # how many augmented variants per original (not counting the original)
-    num_aug_per_image: int = 50
+    num_aug_per_image: int = 45
     max_center_shift: int = 50 # max pixel shift for random pre-crop translations
     seed: int = 42
     depth_noise_std: float = 0.03  # Gaussian noise std (0-1 range) applied to depth channel
