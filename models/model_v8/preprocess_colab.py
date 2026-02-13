@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import math
 import os
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -49,6 +50,8 @@ class ColabPreprocessConfig:
     num_workers: int = 0  # GPU loop, so keep single process
     max_items: Optional[int] = None
     device: str = 'cuda'
+    flush_size: int = 64
+    save_workers: int = 2
 
 
 def _rng(seed: int) -> np.random.RandomState:
@@ -75,6 +78,63 @@ def _tensor_to_pil(tensor: Tensor) -> Image.Image:
         arr = arr.squeeze(2)
         return Image.fromarray(arr, mode='L')
     return Image.fromarray(arr, mode='RGB')
+
+
+class AsyncImageWriter:
+    """Batches GPU tensors and writes PNGs on background threads."""
+
+    def __init__(self, cfg: ColabPreprocessConfig) -> None:
+        self.rgb_dir = cfg.out_rgb_dir
+        self.depth_dir = cfg.out_depth_dir
+        self.flush_size = max(1, int(cfg.flush_size))
+        self.executor = ThreadPoolExecutor(max_workers=max(1, int(cfg.save_workers)))
+        self._rgb_buf: List[Tensor] = []
+        self._depth_buf: List[Tensor] = []
+        self._ids: List[int] = []
+        self._futures: List = []
+        self._closed = False
+
+    def add(self, rgb: Tensor, depth: Tensor, out_id: int) -> None:
+        if self._closed:
+            raise RuntimeError('AsyncImageWriter already closed')
+        rgb_u8 = (rgb.detach().clamp(0.0, 1.0) * 255.0).round().to(torch.uint8)
+        depth_u8 = (depth.detach().clamp(0.0, 1.0) * 255.0).round().to(torch.uint8)
+        self._rgb_buf.append(rgb_u8)
+        self._depth_buf.append(depth_u8)
+        self._ids.append(out_id)
+        if len(self._ids) >= self.flush_size:
+            self._flush()
+
+    def _flush(self) -> None:
+        if not self._ids:
+            return
+        rgb_tensor = torch.stack(self._rgb_buf, dim=0).to('cpu', non_blocking=True)
+        depth_tensor = torch.stack(self._depth_buf, dim=0).to('cpu', non_blocking=True)
+        rgb_np = rgb_tensor.permute(0, 2, 3, 1).numpy()
+        depth_np = depth_tensor.squeeze(1).numpy()
+        ids = self._ids[:]
+        future = self.executor.submit(self._write_batch, rgb_np, depth_np, ids, self.rgb_dir, self.depth_dir)
+        self._futures.append(future)
+        self._rgb_buf.clear()
+        self._depth_buf.clear()
+        self._ids.clear()
+
+    @staticmethod
+    def _write_batch(rgb_np: np.ndarray, depth_np: np.ndarray, ids: List[int], rgb_dir: str, depth_dir: str) -> None:
+        for rgb_arr, depth_arr, out_id in zip(rgb_np, depth_np, ids):
+            rgb_img = Image.fromarray(rgb_arr.astype(np.uint8), mode='RGB')
+            depth_img = Image.fromarray(depth_arr.astype(np.uint8), mode='L')
+            rgb_img.save(os.path.join(rgb_dir, f'RGB_{out_id}.png'))
+            depth_img.save(os.path.join(depth_dir, f'Depth_{out_id}.png'))
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._flush()
+        for fut in self._futures:
+            fut.result()
+        self.executor.shutdown(wait=True)
+        self._closed = True
 
 
 def _resize_tensor(img: Tensor, size: int) -> Tensor:
@@ -148,13 +208,14 @@ def _color_jitter(rgb: Tensor, rng: np.random.RandomState) -> Tensor:
         (b - gray) * saturation + gray,
     ])
 
-    u = torch.cos(torch.tensor(hue))
-    w = torch.sin(torch.tensor(hue))
-    rot = torch.tensor([
-        [u, -w, 0],
-        [w, u, 0],
-        [0, 0, 1],
-    ], dtype=rgb.dtype, device=rgb.device)
+    hue_tensor = torch.tensor(hue, dtype=rgb.dtype, device=rgb.device)
+    cos_h = torch.cos(hue_tensor)
+    sin_h = torch.sin(hue_tensor)
+    rot = torch.eye(3, dtype=rgb.dtype, device=rgb.device)
+    rot[0, 0] = cos_h
+    rot[0, 1] = -sin_h
+    rot[1, 0] = sin_h
+    rot[1, 1] = cos_h
     rgb = torch.matmul(rot, rgb.view(3, -1)).view_as(rgb)
     return rgb.clamp(0.0, 1.0)
 
@@ -173,7 +234,7 @@ def _apply_geom_augs(rgb: Tensor, depth: Tensor, rng: np.random.RandomState) -> 
     return rgb, depth
 
 
-def build_augmented_samples(row: Dict, idx: int, cfg: ColabPreprocessConfig, device: torch.device) -> List[Dict]:
+def build_augmented_samples(row: Dict, idx: int, cfg: ColabPreprocessConfig, device: torch.device, writer: AsyncImageWriter) -> List[Dict]:
     orig_id = int(row['id'])
     rgb_path = os.path.join(cfg.train_rgb_dir, f'RGB_{orig_id}.png')
     depth_path = os.path.join(cfg.train_depth_dir, f'Depth_{orig_id}.png')
@@ -188,18 +249,12 @@ def build_augmented_samples(row: Dict, idx: int, cfg: ColabPreprocessConfig, dev
     base_out_id = idx * per + 1
     outputs: List[Dict] = []
 
-    def _save(t_rgb: Tensor, t_depth: Tensor, out_id: int) -> None:
-        rgb_img = _tensor_to_pil(t_rgb)
-        depth_img = _tensor_to_pil(t_depth)
-        rgb_img.save(os.path.join(cfg.out_rgb_dir, f'RGB_{out_id}.png'))
-        depth_img.save(os.path.join(cfg.out_depth_dir, f'Depth_{out_id}.png'))
-
     def _prep(sample_rgb: Tensor, sample_depth: Tensor, local_rng: np.random.RandomState, out_id: int) -> None:
         shift = _random_center_shift(local_rng, cfg.max_center_shift)
         crop_side = _random_crop_size((rgb0.shape[1], rgb0.shape[2]), (depth0.shape[1], depth0.shape[2]), cfg, local_rng)
         rgb_c = _resize_tensor(_crop_tensor(sample_rgb, crop_side, shift), cfg.image_size)
         depth_c = _resize_tensor(_crop_tensor(sample_depth, crop_side, shift), cfg.image_size)
-        _save(rgb_c, depth_c, out_id)
+        writer.add(rgb_c, depth_c, out_id)
         out_row = dict(row)
         out_row['id'] = out_id
         out_row['original_id'] = orig_id
@@ -238,11 +293,15 @@ def preprocess(cfg: ColabPreprocessConfig) -> None:
     device = torch.device(cfg.device if torch.cuda.is_available() or 'cuda' not in cfg.device else 'cpu')
     print(f"Using device: {device}")
 
+    writer = AsyncImageWriter(cfg)
     all_rows: List[Dict] = []
-    for idx, (_, row) in enumerate(tqdm(df.iterrows(), total=len(df), desc='Augmenting', unit='img')):
-        rows = build_augmented_samples(row.to_dict(), idx, cfg, device)
-        if rows:
-            all_rows.extend(rows)
+    try:
+        for idx, (_, row) in enumerate(tqdm(df.iterrows(), total=len(df), desc='Augmenting', unit='img')):
+            rows = build_augmented_samples(row.to_dict(), idx, cfg, device, writer)
+            if rows:
+                all_rows.extend(rows)
+    finally:
+        writer.close()
 
     out_df = pd.DataFrame(all_rows)
     out_df.to_csv(cfg.out_csv, index=False)
@@ -268,6 +327,8 @@ def parse_args(args: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument('--color-jitter-prob', type=float, default=ColabPreprocessConfig.color_jitter_prob)
     parser.add_argument('--max-items', type=int, default=None)
     parser.add_argument('--device', default=ColabPreprocessConfig.device)
+    parser.add_argument('--flush-size', type=int, default=ColabPreprocessConfig.flush_size)
+    parser.add_argument('--save-workers', type=int, default=ColabPreprocessConfig.save_workers)
     return parser.parse_args(args)
 
 
@@ -291,5 +352,7 @@ if __name__ == '__main__':
         color_jitter_prob=args.color_jitter_prob,
         max_items=args.max_items,
         device=args.device,
+        flush_size=args.flush_size,
+        save_workers=args.save_workers,
     )
     preprocess(cfg)
