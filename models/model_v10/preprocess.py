@@ -35,7 +35,8 @@ from PIL import Image
 try:
     import torchvision.transforms as T
     import torchvision.transforms.functional as TF
-except Exception:  # pragma: no cover
+except Exception as _exc:  # pragma: no cover
+    print(f"[preprocess] WARNING: torchvision import failed: {_exc}")
     T = None  # type: ignore[assignment]
     TF = None  # type: ignore[assignment]
 
@@ -81,7 +82,7 @@ class PreprocessConfig:
     seed: int = 42
     num_workers: Optional[int] = None
     max_items: Optional[int] = None
-    use_gpu: bool = True  # run augmentations on GPU (much faster); set False for CPU-only
+    use_gpu: bool = False  # run augmentations on GPU (much faster); set False for CPU-only
 
 
 # ---------------------------------------------------------------------------
@@ -268,6 +269,11 @@ def _gpu_augment_one_original(
     device: torch.device,
 ) -> List[Dict]:
     """Generate original + all augmented copies on the GPU."""
+    if TF is None:
+        raise RuntimeError(
+            "GPU augmentation requires torchvision but it failed to import. "
+            "Install it with: pip install torchvision  — or set use_gpu=False."
+        )
     results: List[Dict] = []
 
     # Convert to tensors on GPU once

@@ -64,7 +64,7 @@ class TrainConfig:
 
     # ---- training ---------------------------------------------------------
     batch_size: int = 256
-    num_epochs: int = 100
+    num_epochs: int = 200
     lr: float = 1e-3
     weight_decay: float = 1e-3
 
@@ -79,15 +79,15 @@ class TrainConfig:
     val_per_cell: int = 3  # original images per (variety × weight-regime) cell in val
     val_ratio: float = 0.2
     seed: int = 43
-    patience: int = 100
+    patience: int = 150
     num_folds: int = 1
     group_by_original: bool = True
 
     # ---- architecture -----------------------------------------------------
     drop_path_prob: float = 0.15
-    rgb_widths: Tuple[int, ...] = (16, 32, 48, 64)
-    rgbd_widths: Tuple[int, ...] = (16, 32, 64, 96)
-    embed_dim: int = 64
+    rgb_widths: Tuple[int, ...] = (16, 32, 64, 96)
+    rgbd_widths: Tuple[int, ...] = (16, 32, 64, 128)
+    embed_dim: int = 96
 
     # ---- regularisation ---------------------------------------------------
     mixup_alpha: float = 0.4
