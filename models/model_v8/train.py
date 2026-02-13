@@ -31,7 +31,7 @@ class TrainConfig:
     rgb_dir: str = '../../datasets/Training/Augmented_v8/RGBImages'
     depth_dir: str = '../../datasets/Training/Augmented_v8/DepthImages'
 
-    batch_size: int = 128
+    batch_size: int = 256
     num_epochs: int = 50
     lr: float = 1e-3
     weight_decay: float = 1e-4
@@ -44,6 +44,7 @@ class TrainConfig:
     patience: int = 100
     outputs_per_original: int = 41
     num_folds: int = 1
+    group_by_original: bool = True
 
     preload_to_gpu: bool = False
     preload_device: str = 'cuda'
@@ -63,11 +64,10 @@ class TrainConfig:
     unfreeze_interval: int = 5
     rgb_unfreeze_interval: int = 5
     rgbd_unfreeze_interval: int = 7
-    plateau_window: int = 3
-    plateau_delta: float = 0.01
+    unfreeze_start_epoch: int = 15
     branch_warmup_epochs: int = 2
     branch_warmup_scale: float = 0.3
-    huber_delta: float = 0.2
+    huber_delta: float = 0.4
 
 
 def seed_everything(seed: int = 42, deterministic: bool = True):
@@ -134,10 +134,8 @@ def apply_block_freezing(blocks: Sequence[nn.Module], frozen_count: int) -> None
 
 def maybe_unfreeze_blocks(
     epoch: int,
+    start_epoch: int,
     interval: int,
-    val_history: Sequence[float],
-    plateau_window: int,
-    plateau_delta: float,
     current_frozen: int,
     blocks: Sequence[nn.Module],
     branch_name: str,
@@ -145,31 +143,23 @@ def maybe_unfreeze_blocks(
 ) -> Tuple[int, int | None]:
     if current_frozen <= 0:
         return current_frozen, None
-    interval_trigger = interval > 0 and (epoch + 1) % interval == 0
-    plateau_trigger = _val_plateaued(val_history, plateau_window, plateau_delta)
-    if not interval_trigger and not plateau_trigger:
+    if (epoch + 1) < max(1, start_epoch):
+        return current_frozen, None
+    if interval <= 0:
+        interval_trigger = (epoch + 1) == max(1, start_epoch)
+    else:
+        elapsed = (epoch + 1) - max(1, start_epoch)
+        interval_trigger = elapsed >= 0 and (elapsed % interval == 0)
+    if not interval_trigger:
         return current_frozen, None
     new_frozen = max(0, current_frozen - 1)
     if new_frozen == current_frozen:
         return current_frozen, None
     apply_block_freezing(blocks, new_frozen)
-    reason = 'plateau' if plateau_trigger and not interval_trigger else 'interval'
-    if plateau_trigger and interval_trigger:
-        reason = 'plateau+interval'
-    print(f"[train] unfreezing {branch_name} block index {new_frozen} (reason={reason})")
+    print(f"[train] unfreezing {branch_name} block index {new_frozen} (reason=schedule)")
     if on_unfreeze is not None:
         on_unfreeze(new_frozen)
     return new_frozen, new_frozen
-
-
-def _val_plateaued(val_history: Sequence[float], window: int, delta: float) -> bool:
-    if window <= 0 or len(val_history) < window * 2:
-        return False
-    recent = val_history[-window:]
-    previous = val_history[-window * 2 : -window]
-    prev_mean = float(np.mean(previous))
-    recent_mean = float(np.mean(recent))
-    return (prev_mean - recent_mean) <= float(delta)
 
 
 def start_block_warmup(
@@ -293,6 +283,9 @@ def _build_full_dataset(cfg: TrainConfig) -> PlantDatasetV8:
 
 
 def _compute_group_ids(full_df, cfg: TrainConfig) -> Tuple[np.ndarray, bool]:
+    if not cfg.group_by_original:
+        ids = np.arange(len(full_df), dtype=int)
+        return ids, False
     has_original_ids = 'original_id' in full_df.columns
     if has_original_ids:
         group_ids = full_df['original_id'].astype(int).to_numpy()
@@ -622,10 +615,8 @@ def train_fusion_regressor(
 
             frozen_rgb, _ = maybe_unfreeze_blocks(
                 epoch,
+                cfg.unfreeze_start_epoch,
                 rgb_interval,
-                val_history,
-                cfg.plateau_window,
-                cfg.plateau_delta,
                 frozen_rgb,
                 rgb_blocks,
                 'RGB',
@@ -633,10 +624,8 @@ def train_fusion_regressor(
             )
             frozen_rgbd, _ = maybe_unfreeze_blocks(
                 epoch,
+                cfg.unfreeze_start_epoch,
                 rgbd_interval,
-                val_history,
-                cfg.plateau_window,
-                cfg.plateau_delta,
                 frozen_rgbd,
                 rgbd_blocks,
                 'RGBD',
