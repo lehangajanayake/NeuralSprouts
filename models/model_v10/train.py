@@ -66,9 +66,12 @@ class TrainConfig:
     num_epochs: int = 100
     lr: float = 1e-3
     weight_decay: float = 1e-4
-    scheduler_factor: float = 0.5
-    scheduler_patience: int = 10
-    scheduler_min_lr: float = 1e-6
+
+    # OneCycleLR schedule — smooth warm-up → cosine decay per batch
+    onecycle_max_lr: float = 3e-3
+    onecycle_pct_start: float = 0.3        # fraction of training spent warming up
+    onecycle_div_factor: float = 25.0      # initial_lr = max_lr / div_factor
+    onecycle_final_div_factor: float = 1e4 # final_lr  = initial_lr / final_div_factor
 
     # ---- split / fold -----------------------------------------------------
     val_ratio: float = 0.2
@@ -328,9 +331,16 @@ def _train_one_fold(  # noqa: C901
             model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay
         )
 
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, "min", factor=cfg.scheduler_factor,
-        patience=cfg.scheduler_patience, min_lr=cfg.scheduler_min_lr,
+    steps_per_epoch = len(train_loader)
+    total_steps = steps_per_epoch * cfg.num_epochs
+    scheduler = optim.lr_scheduler.OneCycleLR(
+        optimizer,
+        max_lr=cfg.onecycle_max_lr,
+        total_steps=total_steps,
+        pct_start=cfg.onecycle_pct_start,
+        div_factor=cfg.onecycle_div_factor,
+        final_div_factor=cfg.onecycle_final_div_factor,
+        anneal_strategy="cos",
     )
     stopper = _EarlyStopper(cfg.patience)
 
@@ -407,6 +417,7 @@ def _train_one_fold(  # noqa: C901
                 if (step + 1) % accum == 0 or (step + 1) == len(train_loader):
                     scaler.step(optimizer)
                     scaler.update()
+                    scheduler.step()  # OneCycleLR steps per batch
                     optimizer.zero_grad(set_to_none=True)
                     if use_ema and ema_model is not None:
                         _update_ema(ema_model, model, cfg.ema_decay)
@@ -459,7 +470,6 @@ def _train_one_fold(  # noqa: C901
                 print(f"  early stop at epoch {epoch+1} (best={stopper.best:.4f})")
                 break
 
-            scheduler.step(v_mae)
             _tick_warmups(warmups)
 
     except KeyboardInterrupt:

@@ -165,7 +165,7 @@ Because all data lives in RAM as contiguous tensors, the DataLoader uses
 | **Channel-attention (SE)** | Adds a Squeeze-and-Excitation block before spatial attention | Insert `SEBlock` in `RegressionBranch` after `features` |
 | **Test-time augmentation (TTA)** | Average predictions over flips/rotations | Wrap `predict.py` with an augmentation loop |
 | **Knowledge distillation** | Train a smaller student from a larger teacher | Standard KD loss added to `train.py` |
-| **OneCycleLR** | Aggressive warm-up + cosine decay; often reaches better MAE in fewer epochs | `torch.optim.lr_scheduler.OneCycleLR` |
+| ~~OneCycleLR~~ | ✅ **Implemented** — warm-up → cosine decay, steps per batch | Default scheduler in `train.py` |
 | **Pre-loading to GPU** | Move the entire `ShardDataset` tensors to CUDA once | `ds.rgb = ds.rgb.to('cuda')` before building DataLoader |
 | **WebDataset / FFCV** | Industrial-grade streaming dataloaders for very large datasets | Requires reformatting shards |
 
@@ -193,7 +193,11 @@ script.  No CLI parsing is required — just edit the defaults and re-run.
 |---|---|---|
 | `batch_size` | 256 | Mini-batch size |
 | `num_epochs` | 100 | Maximum epochs |
-| `lr` | 1e-3 | Initial learning rate |
+| `lr` | 1e-3 | Initial learning rate (used for optimizer base) |
+| `onecycle_max_lr` | 3e-3 | Peak learning rate for OneCycleLR |
+| `onecycle_pct_start` | 0.3 | Fraction of training spent warming up |
+| `onecycle_div_factor` | 25.0 | `initial_lr = max_lr / div_factor` |
+| `onecycle_final_div_factor` | 1e4 | `final_lr = initial_lr / final_div_factor` |
 | `use_amp` | True | Enable mixed-precision training |
 | `use_compile` | False | Enable `torch.compile` |
 | `grad_accum_steps` | 1 | Gradient accumulation steps |

@@ -216,6 +216,8 @@ __marimo__/
 /datasets/Training/AugmentedMixup/
 /datasets/Test/Augmented/
 /datasets/Training/Augmented_v8
+/datasets/Training/Shards_v10
+
 Test_with_predictions.csv
 
 
