@@ -1,0 +1,223 @@
+1. Goal
+
+Implement Model v4, a multi-branch CNN in PyTorch for lettuce analysis.
+
+RGB branch → lettuce type classification (4 classes)
+
+RGBD branch → dry weight regression
+
+Fusion network → final dry weight prediction
+
+Competition metric: MAE on dry weight only
+
+2. Data & Inputs
+
+RGB images are loaded from RGBImages
+
+Depth images are loaded from DepthImages
+
+RGBD input is formed by concatenating RGB + Depth as the 4th channel
+
+Mandatory preprocessing (train + eval)
+
+Center crop 900 × 900
+
+Resize to 64 × 64
+
+Input tensors
+
+RGB branch: 3 × 64 × 64
+
+RGBD branch: 4 × 64 × 64
+
+3. Model Architecture
+Branch 1 — RGB Classification
+
+Multiple Conv2d → BatchNorm → ReLU → MaxPool blocks
+
+Fully connected head
+
+Output: 4 logits
+
+Branch 2 — RGBD Regression
+
+Multiple Conv2d → BatchNorm → ReLU → MaxPool blocks
+
+Fully connected head
+
+Output: 1 scalar (dry weight)
+
+Fusion Network
+
+Input: concatenation of:
+
+4 logits from RGB branch
+
+1 regression output from RGBD branch
+
+Input dimension: 5
+
+Multiple Linear → ReLU → Dropout layers
+
+Output: 1 scalar (final dry weight)
+
+4. Training Strategy — Freezing & Unfreezing (Critical)
+
+Training is strictly staged. Each stage uses its own optimizer and early stopping.
+Only the specified parameters are trainable in each stage.
+
+Stage 1 — Train RGB Classification Branch
+
+Trainable
+
+RGB branch
+
+Frozen
+
+RGBD branch
+
+Fusion network
+
+Loss
+
+CrossEntropyLoss
+
+Early stopping
+
+Patience-based on validation classification loss
+
+Checkpoint
+
+Save best RGB branch weights
+
+Reload best checkpoint before Stage 2
+
+Stage 2 — Train RGBD Regression Branch
+
+Trainable
+
+RGBD branch
+
+Frozen
+
+RGB branch
+
+Fusion network
+
+Loss
+
+L1Loss (MAE)
+
+Early stopping
+
+Patience-based on validation MAE
+
+Checkpoint
+
+Save best RGBD branch weights
+
+Reload best checkpoint before Stage 3
+
+Stage 3 — Train Fusion Model (Joint Fine-Tuning)
+
+Trainable
+
+RGB branch (unfrozen)
+
+RGBD branch (unfrozen)
+
+Fusion network
+
+Frozen
+
+None
+
+Forward pass
+
+RGB → logits
+
+RGBD → dry weight
+
+Concatenate outputs → fusion → final dry weight
+
+Loss
+
+L1Loss (MAE) on fusion output only
+
+Early stopping
+
+Patience-based on validation MAE (competition metric)
+
+Checkpoint
+
+Save best full model
+
+5. Preprocessing Script (preprocessing.py)
+Responsibilities
+
+Create augmented dataset if missing
+
+Load RGB and Depth images
+
+Apply:
+
+Center crop 900 × 900
+
+Resize 64 × 64
+
+Random augmentations (reused from Model v2):
+
+Horizontal flip
+
+Vertical flip
+
+Rotation
+
+Color jitter (RGB only)
+
+Brightness / contrast
+
+Save augmented RGB and Depth images
+
+Generate updated augmented CSV with labels
+
+6. Training Data
+
+Training uses augmented data and its CSV
+
+Validation split comes from augmented data
+
+Depth normalization is handled separately from RGB
+
+7. Evaluation Script (evaluate.py)
+Responsibilities
+
+Load trained Model v4
+
+Load RGB + Depth images
+
+Apply:
+
+Center crop 900 × 900
+
+Resize 64 × 64
+
+Use ground truth from training CSV
+
+Report:
+
+MAE on dry weight (primary)
+
+Classification accuracy optional
+
+8. Constraints
+
+PyTorch only (no Lightning)
+
+Windows environment
+
+Deterministic training (set seeds)
+
+Explicit parameter freezing via requires_grad
+
+Separate optimizers per stage
