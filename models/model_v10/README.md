@@ -166,7 +166,7 @@ Because all data lives in RAM as contiguous tensors, the DataLoader uses
 | **Test-time augmentation (TTA)** | Average predictions over flips/rotations | Wrap `predict.py` with an augmentation loop |
 | **Knowledge distillation** | Train a smaller student from a larger teacher | Standard KD loss added to `train.py` |
 | ~~OneCycleLR~~ | ✅ **Implemented** — warm-up → cosine decay, steps per batch | Default scheduler in `train.py` |
-| **Pre-loading to GPU** | Move the entire `ShardDataset` tensors to CUDA once | `ds.rgb = ds.rgb.to('cuda')` before building DataLoader |
+| ~~Pre-loading to GPU~~ | ✅ **Implemented** — entire dataset moved to CUDA before training | `preload_to_gpu: true` in `TrainConfig` (default) |
 | **WebDataset / FFCV** | Industrial-grade streaming dataloaders for very large datasets | Requires reformatting shards |
 
 ---
@@ -201,6 +201,7 @@ script.  No CLI parsing is required — just edit the defaults and re-run.
 | `use_amp` | True | Enable mixed-precision training |
 | `use_compile` | False | Enable `torch.compile` |
 | `grad_accum_steps` | 1 | Gradient accumulation steps |
+| `preload_to_gpu` | True | Move entire dataset to CUDA once (eliminates CPU→GPU transfers) |
 | `ema_decay` | 0.995 | EMA decay (0 = disabled) |
 | `mixup_alpha` | 0.2 | Mixup β distribution parameter |
 | `huber_delta` | 0.3 | SmoothL1 β (0 = plain L1) |

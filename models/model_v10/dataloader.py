@@ -123,6 +123,22 @@ class ShardDataset(Dataset):
             "original_id": self.original_ids[idx],
         }
 
+    def to_device(self, device: torch.device) -> "ShardDataset":
+        """Move all data tensors to *device* (e.g. CUDA) **in-place**.
+
+        Call this **before** creating ``Subset`` / ``DataLoader`` so that
+        every ``__getitem__`` returns tensors already on the GPU — zero
+        CPU→GPU transfer during training.
+
+        ``original_ids`` is kept on CPU because it is only used for
+        splitting (NumPy) and never enters the forward pass.
+        """
+        self.rgb = self.rgb.to(device, non_blocking=True)
+        self.rgbd = self.rgbd.to(device, non_blocking=True)
+        self.targets = self.targets.to(device, non_blocking=True)
+        self.ids = self.ids.to(device, non_blocking=True)
+        return self
+
     def get_original_ids_array(self) -> np.ndarray:
         """Return original_id for every sample as a NumPy array (for splitting)."""
         return self.original_ids.numpy().astype(int)

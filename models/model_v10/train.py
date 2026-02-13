@@ -105,6 +105,7 @@ class TrainConfig:
     use_amp: bool = True
     use_compile: bool = False
     grad_accum_steps: int = 1
+    preload_to_gpu: bool = True  # move entire dataset to CUDA once (eliminates CPU→GPU transfers)
 
     # ---- output -----------------------------------------------------------
     out_dir: str = "."
@@ -495,7 +496,8 @@ def main() -> None:
     seed_everything(cfg.seed, deterministic=True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[train] device={device}  AMP={cfg.use_amp and device.type == 'cuda'}  "
-          f"compile={cfg.use_compile}  grad_accum={cfg.grad_accum_steps}")
+          f"compile={cfg.use_compile}  grad_accum={cfg.grad_accum_steps}  "
+          f"gpu_preload={cfg.preload_to_gpu and device.type == 'cuda'}")
 
     # ---- Load shard dataset ------------------------------------------------
     ds = ShardDataset(
@@ -505,7 +507,14 @@ def main() -> None:
     )
     print(f"[train] loaded {len(ds)} samples from shards")
 
+    # Must extract original_ids (CPU numpy) *before* moving tensors to GPU
     orig_ids = ds.get_original_ids_array()
+
+    # Pre-load entire dataset to GPU — eliminates all CPU→GPU transfers
+    if cfg.preload_to_gpu and device.type == "cuda":
+        ds.to_device(device)
+        print(f"[train] pre-loaded dataset to {device}")
+
     splits = _split_by_group(orig_ids, cfg)
     total_folds = len(splits)
     results: List[Tuple[str, str, float]] = []
