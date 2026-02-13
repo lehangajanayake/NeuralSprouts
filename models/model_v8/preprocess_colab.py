@@ -47,7 +47,7 @@ class ColabPreprocessConfig:
     depth_noise_prob: float = 0.7
     color_jitter_prob: float = 0.8
 
-    num_workers: int = 0  # GPU loop, so keep single process
+    num_workers: int = 16  # GPU loop, so keep single process
     max_items: Optional[int] = None
     device: str = 'cuda'
     flush_size: int = 64

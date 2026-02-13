@@ -5,6 +5,7 @@ variants can coexist within the repo.
 """
 
 import os
+from collections import OrderedDict
 from typing import Dict, Optional, Sequence, Tuple
 
 import numpy as np
@@ -64,6 +65,8 @@ class PlantDatasetV8(Dataset):
         self.blacklist_ids = {int(x) for x in blacklist_ids} if blacklist_ids else set()
 
         self._cache: Dict[Tuple[int, int], Dict[str, torch.Tensor]] = {}
+        self._shard_cache: 'OrderedDict[str, Dict[str, torch.Tensor]]' = OrderedDict()
+        self._shard_cache_limit = 6
 
         self.df = pd.read_csv(labels_csv)
         if 'image_id' in self.df.columns:
@@ -74,31 +77,57 @@ class PlantDatasetV8(Dataset):
         if missing:
             raise ValueError(f"CSV missing columns: {sorted(missing)}")
 
-        keep_rows = []
-        for _, row in self.df.iterrows():
-            image_id = int(row['id'])
-            if self.blacklist_ids:
-                original_id = row.get('original_id')
-                if image_id in self.blacklist_ids:
+        self.use_shards = {'shard_path', 'shard_index'}.issubset(self.df.columns)
+        if self.use_shards:
+            keep_rows = []
+            for _, row in self.df.iterrows():
+                image_id = int(row['id'])
+                if self.blacklist_ids:
+                    original_id = row.get('original_id')
+                    if image_id in self.blacklist_ids:
+                        continue
+                    if original_id is not None and not pd.isna(original_id) and int(original_id) in self.blacklist_ids:
+                        continue
+                shard_path = os.path.abspath(str(row['shard_path']))
+                if not os.path.exists(shard_path):
                     continue
-                if original_id is not None and not pd.isna(original_id) and int(original_id) in self.blacklist_ids:
+                r = row.copy()
+                r['shard_path'] = shard_path
+                keep_rows.append(r)
+            self.df = pd.DataFrame(keep_rows).reset_index(drop=True)
+            self.num_views = 1
+            self.center_crop = False
+            self.augment = False
+        else:
+            keep_rows = []
+            for _, row in self.df.iterrows():
+                image_id = int(row['id'])
+                if self.blacklist_ids:
+                    original_id = row.get('original_id')
+                    if image_id in self.blacklist_ids:
+                        continue
+                    if original_id is not None and not pd.isna(original_id) and int(original_id) in self.blacklist_ids:
+                        continue
+                rgb_path = os.path.join(self.rgb_dir, f"RGB_{image_id}.png")
+                depth_path = os.path.join(self.depth_dir, f"Depth_{image_id}.png")
+                if not (os.path.exists(rgb_path) and os.path.exists(depth_path)):
                     continue
-            rgb_path = os.path.join(self.rgb_dir, f"RGB_{image_id}.png")
-            depth_path = os.path.join(self.depth_dir, f"Depth_{image_id}.png")
-            if not (os.path.exists(rgb_path) and os.path.exists(depth_path)):
-                continue
-            row = row.copy()
-            row['rgb_path'] = rgb_path
-            row['depth_path'] = depth_path
-            keep_rows.append(row)
-        self.df = pd.DataFrame(keep_rows).reset_index(drop=True)
+                row = row.copy()
+                row['rgb_path'] = rgb_path
+                row['depth_path'] = depth_path
+                keep_rows.append(row)
+            self.df = pd.DataFrame(keep_rows).reset_index(drop=True)
 
-        if T is None:
+        if self.use_shards:
+            self.resize = None
+            self.color_jitter = None
+        elif T is None:
             self.resize = None
             self.color_jitter = None
         else:
             self.resize = T.Resize((self.image_size, self.image_size))
             self.color_jitter = T.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.02)
+        self.runtime_augment = bool(self.augment and T is not None and not self.use_shards)
 
     def __len__(self) -> int:
         base_len = len(self.df)
@@ -119,7 +148,7 @@ class PlantDatasetV8(Dataset):
         base_idx: int,
         view_idx: int,
     ) -> Tuple[Image.Image, Image.Image]:
-        if not self.augment or T is None:
+        if not self.runtime_augment:
             return rgb, depth
 
         rng = np.random.RandomState(self.seed + int(base_idx) * 9973 + int(view_idx) * 101)
@@ -148,42 +177,76 @@ class PlantDatasetV8(Dataset):
             if key in self._cache:
                 return self._cache[key]
 
-        row = self.df.iloc[int(base_idx)]
-        rgb = Image.open(row['rgb_path']).convert('RGB')
-        depth = Image.open(row['depth_path']).convert('L')
-
-        if self.center_crop:
-            rgb = _center_crop(rgb)
-            depth = _center_crop(depth)
-        rgb, depth = self._maybe_aug(rgb, depth, base_idx, view_idx)
-
-        if self.resize is not None:
-            rgb = self.resize(rgb)
-            depth = self.resize(depth)
+        if self.use_shards:
+            sample = self._sample_from_shard(int(base_idx))
         else:
-            rgb = rgb.resize((self.image_size, self.image_size), resample=Image.BILINEAR)
-            depth = depth.resize((self.image_size, self.image_size), resample=Image.BILINEAR)
+            row = self.df.iloc[int(base_idx)]
+            rgb = Image.open(row['rgb_path']).convert('RGB')
+            depth = Image.open(row['depth_path']).convert('L')
 
-        rgb_np = np.asarray(rgb, dtype=np.float32) / 255.0
-        depth_np = np.asarray(depth, dtype=np.float32) / 255.0
-        if depth_np.ndim == 2:
-            depth_np = depth_np[..., None]
+            if self.center_crop:
+                rgb = _center_crop(rgb)
+                depth = _center_crop(depth)
+            rgb, depth = self._maybe_aug(rgb, depth, base_idx, view_idx)
 
-        rgb_t = torch.from_numpy(rgb_np).permute(2, 0, 1).contiguous()
-        depth_t = torch.from_numpy(depth_np).permute(2, 0, 1).contiguous()
-        rgbd_t = torch.cat([rgb_t, depth_t], dim=0)
+            if self.resize is not None:
+                rgb = self.resize(rgb)
+                depth = self.resize(depth)
+            else:
+                rgb = rgb.resize((self.image_size, self.image_size), resample=Image.BILINEAR)
+                depth = depth.resize((self.image_size, self.image_size), resample=Image.BILINEAR)
 
-        sample = {
-            'id': torch.tensor(int(row['id']), dtype=torch.long),
-            'rgb': rgb_t,
-            'rgbd': rgbd_t,
-            'dry_weight': torch.tensor(float(row['DryWeightShoot']), dtype=torch.float32),
-        }
+            rgb_np = np.asarray(rgb, dtype=np.float32) / 255.0
+            depth_np = np.asarray(depth, dtype=np.float32) / 255.0
+            if depth_np.ndim == 2:
+                depth_np = depth_np[..., None]
+
+            rgb_t = torch.from_numpy(rgb_np).permute(2, 0, 1).contiguous()
+            depth_t = torch.from_numpy(depth_np).permute(2, 0, 1).contiguous()
+            rgbd_t = torch.cat([rgb_t, depth_t], dim=0)
+
+            sample = {
+                'id': torch.tensor(int(row['id']), dtype=torch.long),
+                'rgb': rgb_t,
+                'rgbd': rgbd_t,
+                'dry_weight': torch.tensor(float(row['DryWeightShoot']), dtype=torch.float32),
+            }
 
         if self.enable_cache:
             self._cache[(base_idx, view_idx)] = sample
 
         return sample
+
+    def _sample_from_shard(self, base_idx: int) -> Dict[str, torch.Tensor]:
+        row = self.df.iloc[int(base_idx)]
+        shard_path = str(row['shard_path'])
+        shard_index = int(row['shard_index'])
+        shard = self._load_shard(shard_path)
+        rgb_u8 = shard['rgb'][shard_index]
+        depth_u8 = shard['depth'][shard_index]
+        rgb_t = rgb_u8.to(torch.float32) / 255.0
+        depth_t = depth_u8.to(torch.float32) / 255.0
+        if depth_t.ndim == 2:
+            depth_t = depth_t.unsqueeze(0)
+        sample = {
+            'id': torch.tensor(int(row['id']), dtype=torch.long),
+            'rgb': rgb_t,
+            'rgbd': torch.cat([rgb_t, depth_t], dim=0),
+            'dry_weight': torch.tensor(float(row['DryWeightShoot']), dtype=torch.float32),
+        }
+        return sample
+
+    def _load_shard(self, path: str) -> Dict[str, torch.Tensor]:
+        path = os.path.abspath(path)
+        cache = self._shard_cache
+        if path in cache:
+            shard = cache.pop(path)
+        else:
+            shard = torch.load(path, map_location='cpu')
+        cache[path] = shard
+        if len(cache) > self._shard_cache_limit:
+            cache.popitem(last=False)
+        return shard
 
     def build_cache(self, max_base_items: Optional[int] = None) -> None:
         self.enable_cache = True
