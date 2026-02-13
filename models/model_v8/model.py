@@ -238,14 +238,22 @@ class LettuceSAMFusionNet(nn.Module):
         spatial_kernel: Union[int, Tuple[int, ...]] = 5,
         spatial_layers: int = 1,
         spatial_dropout: float = 0.0,
+        share_spatial_attn: bool = False,
     ):
         super().__init__()
         layers = max(1, int(spatial_layers))
-        self.shared_spatial_attn = SpatialAttentionStack(
-            kernel_sizes=spatial_kernel,
-            num_layers=layers,
-            dropout=spatial_dropout,
-        )
+        stack_kwargs = {
+            'kernel_sizes': spatial_kernel,
+            'num_layers': layers,
+            'dropout': spatial_dropout,
+        }
+        if share_spatial_attn:
+            shared = SpatialAttentionStack(**stack_kwargs)
+            self.rgb_attn = shared
+            self.rgbd_attn = shared
+        else:
+            self.rgb_attn = SpatialAttentionStack(**stack_kwargs)
+            self.rgbd_attn = SpatialAttentionStack(**stack_kwargs)
         self.rgb_branch = RGBRegressionBranch(drop_path_prob=drop_path_prob, widths=rgb_widths, embed_dim=embed_dim)
         self.rgbd_branch = RGBDRegressionBranch(drop_path_prob=drop_path_prob, widths=rgbd_widths, embed_dim=embed_dim)
         fusion_in_dim = self.rgb_branch.embedding_dim + self.rgbd_branch.embedding_dim
@@ -253,8 +261,8 @@ class LettuceSAMFusionNet(nn.Module):
         self.fusion_in_dropout = nn.Dropout(p=0.2)
 
     def forward(self, rgb: torch.Tensor, rgbd: torch.Tensor):
-        rgb_pred, rgb_feat = self.rgb_branch(rgb, self.shared_spatial_attn)
-        rgbd_pred, rgbd_feat = self.rgbd_branch(rgbd, self.shared_spatial_attn)
+        rgb_pred, rgb_feat = self.rgb_branch(rgb, self.rgb_attn)
+        rgbd_pred, rgbd_feat = self.rgbd_branch(rgbd, self.rgbd_attn)
         fusion_in = torch.cat([rgb_feat, rgbd_feat], dim=1)
         fusion_in = self.fusion_in_dropout(fusion_in)
         fusion_pred = self.fusion(fusion_in)

@@ -60,6 +60,7 @@ class TrainConfig:
     spatial_kernel: Tuple[int, ...] = (3, 5, 7)
     spatial_layers: int = 3
     spatial_dropout: float = 0.1
+    share_spatial_attn: bool = False
 
     mixup_alpha: float = 0.2
     mixup_prob: float = 0.5
@@ -501,6 +502,7 @@ def save_training_curves(train_history: List[float], val_history: List[float], o
     ax.set_xlabel('Epoch')
     ax.set_ylabel('MAE')
     ax.set_title('Training vs Validation MAE')
+    ax.set_ylim(0.0, 1.0)
     ax.grid(True, linestyle='--', linewidth=0.5, alpha=0.6)
     ax.legend()
 
@@ -723,6 +725,7 @@ def main():
             spatial_kernel=cfg.spatial_kernel,
             spatial_layers=cfg.spatial_layers,
             spatial_dropout=cfg.spatial_dropout,
+            share_spatial_attn=cfg.share_spatial_attn,
         ).to(device)
         print(f"[train] training fusion regressor ({label})...")
         best_full, train_hist, val_hist, best_val, best_epoch = train_fusion_regressor(
