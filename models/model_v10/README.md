@@ -1,14 +1,26 @@
-# model\_v10 — Shard-based dual-branch CNN with spatial attention
+# model\_v10 — Shard-based dual-branch CNN with SE + spatial attention + GeM pooling
 
 ## Overview
 
-Model v10 is an evolution of v8 that keeps the same neural architecture
-(dual RGB / RGBD bottleneck branches + CBAM spatial attention + fusion MLP)
-but overhauls the **data pipeline** and **training loop** for speed and
-reproducibility.
+Model v10 is an evolution of v8 that enhances both the **neural architecture**
+and the **data pipeline / training loop**.
+
+### Architecture changes (vs v8)
+
+* **Squeeze-and-Excitation (SE) channel attention** after the conv backbone —
+  learns to re-weight channels (e.g. suppress noisy depth, amplify informative
+  channels).
+* **Generalised Mean (GeM) pooling** replaces fixed average pooling — a
+  learnable exponent *p* interpolates between avg and max pooling.
+* **Unified ``RegressionBranch``** — single class for both RGB and RGBD,
+  eliminating code duplication.
+
+### Pipeline / training changes (vs v8)
 
 | Aspect | v8 | v10 |
 |---|---|---|
+| Channel attention | ✗ | ✓ Squeeze-and-Excitation (SE) per branch |
+| Pooling | `AdaptiveAvgPool2d` | Learnable GeM (generalised mean) |
 | Augmented storage | Individual PNG files | Batched `.pt` tensor shards |
 | I/O during training | Open + decode PNG per sample | Single `torch.load` per shard (all tensors ready) |
 | Mixed precision | ✗ | ✓ (`torch.amp` autocast + GradScaler) |
@@ -162,7 +174,7 @@ Because all data lives in RAM as contiguous tensors, the DataLoader uses
 | **Cosine-annealing LR** | Smoother decay, often better final MAE | Replace `ReduceLROnPlateau` with `CosineAnnealingWarmRestarts` in `train.py` |
 | **Progressive resizing** | Train first at 64×64, then fine-tune at 96×96 | Generate two shard sets; two-phase training |
 | **Label smoothing** | Regularise targets by adding small noise | `target += rng.normal(0, 0.01)` in mixup |
-| **Channel-attention (SE)** | Adds a Squeeze-and-Excitation block before spatial attention | Insert `SEBlock` in `RegressionBranch` after `features` |
+| ~~Channel-attention (SE)~~ | ✅ **Implemented** — SE block before spatial attention in each branch | Built into `RegressionBranch` |
 | **Test-time augmentation (TTA)** | Average predictions over flips/rotations | Wrap `predict.py` with an augmentation loop |
 | **Knowledge distillation** | Train a smaller student from a larger teacher | Standard KD loss added to `train.py` |
 | ~~OneCycleLR~~ | ✅ **Implemented** — warm-up → cosine decay, steps per batch | Default scheduler in `train.py` |
@@ -209,16 +221,16 @@ script.  No CLI parsing is required — just edit the defaults and re-run.
 
 ---
 
-## Checkpoint compatibility
+## Checkpoint format
 
-v10 checkpoints have the same `state_dict` key layout as v8 because the
-unified `RegressionBranch` produces identical parameter names (`rgb_branch.*`,
-`rgbd_branch.*`, `fusion.*`).  You can load a v8 checkpoint into v10:
+v10 checkpoints are **not** backward-compatible with v8 due to the new SE
+and GeM layers.  Use ``LettuceSAMFusionNet.from_checkpoint()`` to load v10
+checkpoints — it auto-infers widths and embed dim:
 
 ```python
 from model import LettuceSAMFusionNet
 
-model = LettuceSAMFusionNet.from_checkpoint("../model_v8/best_model_v8.pth")
+model = LettuceSAMFusionNet.from_checkpoint("best_model_v10.pth")
 ```
 
 ---

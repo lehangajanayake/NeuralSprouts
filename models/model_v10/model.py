@@ -1,17 +1,21 @@
-"""model_v10 — Dual-branch CNN with spatial attention and fusion MLP.
+"""model_v10 — Dual-branch CNN with SE + spatial attention, GeM pooling, and fusion MLP.
 
-Changes from v8
-----------------
+Architectural changes from v8
+------------------------------
 * **Unified ``RegressionBranch``** replaces the near-duplicate
-  ``RGBRegressionBranch`` / ``RGBDRegressionBranch`` classes.  The only
-  difference between the two was the default ``in_channels`` and ``widths``;
-  those are now explicit constructor arguments.
-* All other building blocks (``DropPath``, ``BottleneckBlock``,
-  ``SpatialAttentionModule``, ``FusionMLP``, ``LettuceSAMFusionNet``) are
-  kept structurally identical to v8 so that **existing checkpoints can be
-  loaded** via the helper ``load_v8_checkpoint``.
-* A ``_infer_branch_widths`` class-method on the top-level model makes
+  ``RGBRegressionBranch`` / ``RGBDRegressionBranch`` classes.
+* **Squeeze-and-Excitation (SE) channel attention** inserted after the
+  convolutional backbone and before spatial attention.  SE learns to
+  re-weight channels dynamically — e.g. suppressing noisy depth when
+  it is uninformative.
+* **Generalised Mean (GeM) pooling** replaces ``AdaptiveAvgPool2d``.
+  A learnable exponent *p* interpolates between average (*p* = 1) and
+  max (*p* → ∞) pooling, consistently outperforming fixed average
+  pooling for regression.
+* ``_infer_branch_widths`` class-method on the top-level model makes
   checkpoint introspection reusable across eval / predict scripts.
+
+Note: v10 checkpoints are **not** backward-compatible with v8.
 """
 
 from __future__ import annotations
@@ -89,6 +93,51 @@ class SpatialAttentionModule(nn.Module):
         return x * self.sigmoid(self.conv(torch.cat([avg, mx], dim=1)))
 
 
+class SqueezeExcitation(nn.Module):
+    """SE channel-attention block.
+
+    Learns per-channel scaling factors via global-pool → FC → ReLU → FC → Sigmoid.
+    Particularly useful for RGBD inputs where depth-channel quality varies.
+    """
+
+    def __init__(self, channels: int, reduction: int = 4) -> None:
+        super().__init__()
+        mid = max(1, channels // reduction)
+        self.pool = nn.AdaptiveAvgPool2d(1)
+        self.fc = nn.Sequential(
+            nn.Linear(channels, mid, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(mid, channels, bias=False),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        b, c, _, _ = x.shape
+        scale = self.pool(x).view(b, c)
+        scale = self.fc(scale).view(b, c, 1, 1)
+        return x * scale
+
+
+class GeM(nn.Module):
+    """Generalised Mean pooling with a learnable exponent *p*.
+
+    .. math::
+        \text{GeM}(x) = \left(\frac{1}{HW}\sum_{h,w} x_{h,w}^{p}\right)^{1/p}
+
+    When *p* = 1 this is average pooling; as *p* → ∞ it approaches max
+    pooling.  The exponent is learned during training.
+    """
+
+    def __init__(self, p: float = 3.0, eps: float = 1e-6) -> None:
+        super().__init__()
+        self.p = nn.Parameter(torch.tensor(float(p)))
+        self.eps = float(eps)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # clamp to avoid negative bases (ReLU output is ≥ 0, but eps guards edge cases)
+        return x.clamp(min=self.eps).pow(self.p).mean(dim=(2, 3), keepdim=True).pow(1.0 / self.p)
+
+
 # ---------------------------------------------------------------------------
 # Unified regression branch
 # ---------------------------------------------------------------------------
@@ -120,6 +169,8 @@ class RegressionBranch(nn.Module):
         dropout: float = 0.2,
         drop_path_prob: float = 0.0,
         embed_dim: int = 256,
+        se_reduction: int = 4,
+        gem_p: float = 3.0,
     ) -> None:
         super().__init__()
         if not widths:
@@ -132,9 +183,10 @@ class RegressionBranch(nn.Module):
             blocks.append(BottleneckBlock(ch, w, drop_prob=d))
             ch = w
         self.features = nn.Sequential(*blocks)
+        self.se = SqueezeExcitation(widths[-1], reduction=se_reduction)
         self.spatial_attn = SpatialAttentionModule(kernel_size=7)
         self.post_attn_dropout = nn.Dropout(p=dropout)
-        self.global_pool = nn.AdaptiveAvgPool2d(1)
+        self.global_pool = GeM(p=gem_p)
         self.embedding = nn.Sequential(
             nn.Flatten(),
             nn.Linear(widths[-1], self.embedding_dim),
@@ -145,15 +197,11 @@ class RegressionBranch(nn.Module):
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         x = self.features(x)
-        x = self.post_attn_dropout(self.spatial_attn(x))
+        x = self.se(x)                          # channel attention (which channels matter)
+        x = self.post_attn_dropout(self.spatial_attn(x))  # spatial attention (where to look)
         feat = self.embedding(self.global_pool(x))
         pred = self.regressor(feat).squeeze(-1)
         return pred, feat
-
-
-# Aliases so that checkpoint key names stay compatible with v8
-RGBRegressionBranch = RegressionBranch
-RGBDRegressionBranch = RegressionBranch
 
 
 # ---------------------------------------------------------------------------

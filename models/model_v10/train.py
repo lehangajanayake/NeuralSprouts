@@ -103,7 +103,7 @@ class TrainConfig:
 
     # ---- speed / hardware -------------------------------------------------
     use_amp: bool = True
-    use_compile: bool = False
+    use_compile: bool = False  # requires Triton (Linux only); leave False on Windows
     grad_accum_steps: int = 1
     preload_to_gpu: bool = True  # move entire dataset to CUDA once (eliminates CPU→GPU transfers)
 
