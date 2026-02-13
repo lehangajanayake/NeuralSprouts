@@ -39,10 +39,12 @@ ACTIVATION_PATHS: Dict[str, str] = {
     'RGB Block 1': 'rgb_branch.features.0',
     'RGB Block 4': 'rgb_branch.features.3',
     'RGB Spatial Attention': 'rgb_branch.spatial_attn',
+    'RGB Spatial Attention Map': 'rgb_branch.spatial_attn.activation',
     'RGB Embedding': 'rgb_branch.embedding',
     'RGBD Block 1': 'rgbd_branch.features.0',
     'RGBD Block 4': 'rgbd_branch.features.3',
     'RGBD Spatial Attention': 'rgbd_branch.spatial_attn',
+    'RGBD Spatial Attention Map': 'rgbd_branch.spatial_attn.activation',
     'RGBD Embedding': 'rgbd_branch.embedding',
     'Fusion Input': 'fusion_in_dropout',
     'Fusion Output': 'fusion',
@@ -158,6 +160,53 @@ def _kernel_image(module: torch.nn.Conv2d, index: int) -> Tuple[Image.Image, Dic
     return img, stats
 
 
+def _attention_overlay(
+    rgb: torch.Tensor,
+    attn: torch.Tensor | None,
+    *,
+    min_render_size: int = 384,
+) -> Tuple[Image.Image, Dict[str, float]]:
+    base = _tensor_to_rgb_image(rgb)
+    bw, bh = base.size
+    min_dim = max(1, min(bw, bh))
+    scale = max(1, min_render_size // min_dim)
+    if scale > 1:
+        base = base.resize((bw * scale, bh * scale), Image.NEAREST)
+    bw, bh = base.size
+    if attn is None:
+        return ImageOps.autocontrast(base), {'error': 'attention map unavailable'}
+    heat = attn.squeeze().detach().cpu().numpy()
+    if heat.ndim == 3:
+        heat = heat[0]
+    heat = np.clip(heat, 0.0, 1.0)
+    heat_img = Image.fromarray((heat * 255).astype(np.uint8), mode='L').resize((bw, bh), Image.BILINEAR)
+    heat_rgb = ImageOps.colorize(heat_img, black=(0, 0, 0), white=(255, 0, 0))
+    blended = Image.blend(base, heat_rgb, alpha=0.45)
+    stats = {
+        'min': float(heat.min()),
+        'max': float(heat.max()),
+        'mean': float(heat.mean()),
+        'shape': list(attn.squeeze(0).shape),
+        'high_activation_pct': float((heat > 0.7).mean()),
+    }
+    return blended, stats
+
+
+def _attention_heatmap(attn: torch.Tensor | None, *, min_render_size: int = 384) -> Image.Image:
+    if attn is None:
+        return Image.new('RGB', (min_render_size, min_render_size), color='black')
+    heat = attn.squeeze().detach().cpu().numpy()
+    if heat.ndim == 3:
+        heat = heat[0]
+    heat = np.clip(heat, 0.0, 1.0)
+    h, w = heat.shape
+    new_w = max(min_render_size, w)
+    new_h = max(min_render_size, h)
+    img = Image.fromarray((heat * 255).astype(np.uint8), mode='L')
+    img = img.resize((new_w, new_h), Image.BILINEAR)
+    return ImageOps.colorize(img, black=(6, 34, 64), white=(255, 234, 132))
+
+
 def _channel_journey_images(channel_idx: int) -> List[Tuple[Image.Image, str]]:
     channel = None if channel_idx < 0 else channel_idx
     gallery: List[Tuple[Image.Image, str]] = []
@@ -262,6 +311,13 @@ def analyze_sample(
     kernel_img, kernel_stats = _kernel_image(kernel_module, kernel_idx)
     journey_images = _channel_journey_images(channel_idx)
 
+    rgb_attn = FEATURE_MAPS.get('RGB Spatial Attention Map')
+    rgbd_attn = FEATURE_MAPS.get('RGBD Spatial Attention Map')
+    rgb_overlay, rgb_attn_stats = _attention_overlay(sample['rgb'], rgb_attn)
+    rgbd_overlay, rgbd_attn_stats = _attention_overlay(sample['rgb'], rgbd_attn)
+    rgb_heatmap = _attention_heatmap(rgb_attn)
+    rgbd_heatmap = _attention_heatmap(rgbd_attn)
+
     info = {
         'dataset_index': int(sample_idx),
         'sample_id': int(sample['id'].item()),
@@ -272,6 +328,8 @@ def analyze_sample(
         'abs_error': abs(preds['fusion_pred'] - float(sample['dry_weight'].item())),
         'activation': act_stats,
         'kernel': kernel_stats,
+        'rgb_attention': rgb_attn_stats,
+        'rgbd_attention': rgbd_attn_stats,
     }
 
     return (
@@ -281,6 +339,10 @@ def analyze_sample(
         act_img,
         kernel_img,
         journey_images,
+        rgb_overlay,
+        rgb_heatmap,
+        rgbd_overlay,
+        rgbd_heatmap,
         info,
     )
 
@@ -332,17 +394,45 @@ def main(cfg: ExplorerConfig):
         act_view = gr.Image(label='Activation map', type='pil')
         kernel_view = gr.Image(label='Kernel heatmap', type='pil')
         channel_gallery = gr.Gallery(label='Channel journey', columns=3)
+        rgb_attn_view = gr.Image(label='RGB Spatial Attention Overlay', type='pil')
+        rgb_attn_heat = gr.Image(label='RGB Attention Heatmap', type='pil')
+        rgbd_attn_view = gr.Image(label='RGBD Spatial Attention Overlay', type='pil')
+        rgbd_attn_heat = gr.Image(label='RGBD Attention Heatmap', type='pil')
         meta_view = gr.JSON(label='Details')
 
         run_btn.click(
             by_index,
             inputs=[idx_slider, layer_dropdown, channel_input, kernel_branch, kernel_input],
-            outputs=[idx_slider, rgb_view, depth_view, act_view, kernel_view, channel_gallery, meta_view],
+            outputs=[
+                idx_slider,
+                rgb_view,
+                depth_view,
+                act_view,
+                kernel_view,
+                channel_gallery,
+                rgb_attn_view,
+                rgb_attn_heat,
+                rgbd_attn_view,
+                rgbd_attn_heat,
+                meta_view,
+            ],
         )
         id_btn.click(
             by_id,
             inputs=[id_box, layer_dropdown, channel_input, kernel_branch, kernel_input],
-            outputs=[idx_slider, rgb_view, depth_view, act_view, kernel_view, channel_gallery, meta_view],
+            outputs=[
+                idx_slider,
+                rgb_view,
+                depth_view,
+                act_view,
+                kernel_view,
+                channel_gallery,
+                rgb_attn_view,
+                rgb_attn_heat,
+                rgbd_attn_view,
+                rgbd_attn_heat,
+                meta_view,
+            ],
         )
 
         def random_index(_, layer, channel, branch, kernel_idx):
@@ -352,14 +442,38 @@ def main(cfg: ExplorerConfig):
         random_btn.click(
             random_index,
             inputs=[idx_slider, layer_dropdown, channel_input, kernel_branch, kernel_input],
-            outputs=[idx_slider, rgb_view, depth_view, act_view, kernel_view, channel_gallery, meta_view],
+            outputs=[
+                idx_slider,
+                rgb_view,
+                depth_view,
+                act_view,
+                kernel_view,
+                channel_gallery,
+                rgb_attn_view,
+                rgb_attn_heat,
+                rgbd_attn_view,
+                rgbd_attn_heat,
+                meta_view,
+            ],
         )
 
         # Auto-load first sample
         demo.load(
             by_index,
             inputs=[idx_slider, layer_dropdown, channel_input, kernel_branch, kernel_input],
-            outputs=[idx_slider, rgb_view, depth_view, act_view, kernel_view, channel_gallery, meta_view],
+            outputs=[
+                idx_slider,
+                rgb_view,
+                depth_view,
+                act_view,
+                kernel_view,
+                channel_gallery,
+                rgb_attn_view,
+                rgb_attn_heat,
+                rgbd_attn_view,
+                rgbd_attn_heat,
+                meta_view,
+            ],
         )
 
     demo.launch()

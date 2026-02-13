@@ -21,7 +21,7 @@ class DropPath(nn.Module):
 
 
 class BottleneckBlock(nn.Module):
-    """1x1 -> 5x5 -> 1x1 bottleneck with residual + pooling."""
+    """1x1 -> 3x3 -> 1x1 bottleneck with residual + pooling."""
 
     def __init__(self, in_ch: int, out_ch: int, *, reduction: int = 4, drop_prob: float = 0.0):
         super().__init__()
@@ -66,7 +66,7 @@ class BottleneckBlock(nn.Module):
 class SpatialAttentionModule(nn.Module):
     """Spatial attention block from CBAM (avg + max pooling along channels)."""
 
-    def __init__(self, kernel_size: int = 7):
+    def __init__(self, kernel_size: int = 5):
         super().__init__()
         padding = kernel_size // 2
         self.conv = nn.Conv2d(2, 1, kernel_size=kernel_size, padding=padding, bias=False)
@@ -113,7 +113,6 @@ class RGBRegressionBranch(nn.Module):
             layers.append(BottleneckBlock(c_in, width, drop_prob=drop))
             c_in = width
         self.features = nn.Sequential(*layers)
-        self.spatial_attn = SpatialAttentionModule(kernel_size=7)
         self.post_attn_dropout = nn.Dropout(p=dropout)
         self.global_pool = nn.AdaptiveAvgPool2d((1, 1))
         last_width = widths[-1]
@@ -125,9 +124,9 @@ class RGBRegressionBranch(nn.Module):
         )
         self.regressor = nn.Linear(self.embedding_dim, 1)
 
-    def forward(self, rgb: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, rgb: torch.Tensor, shared_attn: nn.Module) -> Tuple[torch.Tensor, torch.Tensor]:
         x = self.features(rgb)
-        x = self.spatial_attn(x)
+        x = shared_attn(x)
         x = self.post_attn_dropout(x)
         pooled = self.global_pool(x)
         features = self.embedding(pooled)
@@ -157,7 +156,6 @@ class RGBDRegressionBranch(nn.Module):
             layers.append(BottleneckBlock(c_in, width, drop_prob=drop))
             c_in = width
         self.features = nn.Sequential(*layers)
-        self.spatial_attn = SpatialAttentionModule(kernel_size=7)
         self.post_attn_dropout = nn.Dropout(p=dropout)
         self.global_pool = nn.AdaptiveAvgPool2d((1, 1))
         last_width = widths[-1]
@@ -169,9 +167,9 @@ class RGBDRegressionBranch(nn.Module):
         )
         self.regressor = nn.Linear(self.embedding_dim, 1)
 
-    def forward(self, rgbd: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, rgbd: torch.Tensor, shared_attn: nn.Module) -> Tuple[torch.Tensor, torch.Tensor]:
         x = self.features(rgbd)
-        x = self.spatial_attn(x)
+        x = shared_attn(x)
         x = self.post_attn_dropout(x)
         pooled = self.global_pool(x)
         features = self.embedding(pooled)
@@ -205,8 +203,10 @@ class LettuceSAMFusionNet(nn.Module):
         rgb_widths: Tuple[int, ...] = (32, 64, 96, 128),
         rgbd_widths: Tuple[int, ...] = (32, 64, 96, 128),
         embed_dim: int = 256,
+        spatial_kernel: int = 5,
     ):
         super().__init__()
+        self.shared_spatial_attn = SpatialAttentionModule(kernel_size=spatial_kernel)
         self.rgb_branch = RGBRegressionBranch(drop_path_prob=drop_path_prob, widths=rgb_widths, embed_dim=embed_dim)
         self.rgbd_branch = RGBDRegressionBranch(drop_path_prob=drop_path_prob, widths=rgbd_widths, embed_dim=embed_dim)
         fusion_in_dim = self.rgb_branch.embedding_dim + self.rgbd_branch.embedding_dim
@@ -214,8 +214,8 @@ class LettuceSAMFusionNet(nn.Module):
         self.fusion_in_dropout = nn.Dropout(p=0.2)
 
     def forward(self, rgb: torch.Tensor, rgbd: torch.Tensor):
-        rgb_pred, rgb_feat = self.rgb_branch(rgb)
-        rgbd_pred, rgbd_feat = self.rgbd_branch(rgbd)
+        rgb_pred, rgb_feat = self.rgb_branch(rgb, self.shared_spatial_attn)
+        rgbd_pred, rgbd_feat = self.rgbd_branch(rgbd, self.shared_spatial_attn)
         fusion_in = torch.cat([rgb_feat, rgbd_feat], dim=1)
         fusion_in = self.fusion_in_dropout(fusion_in)
         fusion_pred = self.fusion(fusion_in)
