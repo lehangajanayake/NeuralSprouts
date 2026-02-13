@@ -11,9 +11,9 @@ from model import LettuceSAMFusionNet
 
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-TEST_RGB = '../../datasets/Final/RGBImages'
-TEST_DEPTH = '../../datasets/Final/DepthImages'
-TEST_CSV = '../../datasets/Final/Test.csv'
+TEST_RGB = '../../datasets/Test/RGBImages'
+TEST_DEPTH = '../../datasets/Test/DepthImages'
+TEST_CSV = '../../datasets/Test/Test.csv'
 MODEL_PATH = 'best_model_v8.pth'
 IMAGE_SIZE = 96
 OUTPUT_CSV = 'Test_with_predictions_v8.csv'
@@ -75,7 +75,7 @@ def predict_and_save(
     except ValueError as exc:
         print(f"[predict] {exc} — using default widths.")
         rgb_widths = (24, 48, 64, 96)
-        rgbd_widths = (32, 64, 96, 128)
+        rgbd_widths = (48, 96, 144, 192)
 
     model = LettuceSAMFusionNet(
         drop_path_prob=drop_path_prob,
