@@ -46,7 +46,7 @@ class TrainConfig:
     num_folds: int = 1
     group_by_original: bool = True
 
-    preload_to_gpu: bool = False
+    preload_to_gpu: bool = True
     preload_device: str = 'cuda'
 
     out_dir: str = '.'
@@ -57,8 +57,15 @@ class TrainConfig:
     rgb_widths: Tuple[int, ...] = (32, 64, 96, 128)
     rgbd_widths: Tuple[int, ...] = (32, 64, 96, 128)
     embed_dim: int = 256
+
     mixup_alpha: float = 0.2
     mixup_prob: float = 0.5
+
+
+    cutmix_alpha: float = 0.4
+    cutmix_prob: float = 0.0
+
+
     initial_frozen_rgb_blocks: int = 3
     initial_frozen_rgbd_blocks: int = 3
     unfreeze_interval: int = 5
@@ -122,6 +129,48 @@ def maybe_mixup_batch(
     rgbd_mix = lam * rgbd + (1.0 - lam) * rgbd[perm]
     targets_mix = lam * targets + (1.0 - lam) * targets[perm]
     return rgb_mix, rgbd_mix, targets_mix
+
+
+def _rand_bbox(width: int, height: int, lam: float, device: torch.device) -> Tuple[int, int, int, int]:
+    cut_rat = torch.sqrt(torch.tensor(1.0 - lam, device=device))
+    cut_w = int(width * cut_rat.item())
+    cut_h = int(height * cut_rat.item())
+    cx = torch.randint(0, width, (1,), device=device).item()
+    cy = torch.randint(0, height, (1,), device=device).item()
+    x1 = max(cx - cut_w // 2, 0)
+    y1 = max(cy - cut_h // 2, 0)
+    x2 = min(cx + cut_w // 2, width)
+    y2 = min(cy + cut_h // 2, height)
+    if x1 == x2:
+        x2 = min(x1 + 1, width)
+        x1 = max(0, x2 - 1)
+    if y1 == y2:
+        y2 = min(y1 + 1, height)
+        y1 = max(0, y2 - 1)
+    return x1, y1, x2, y2
+
+
+def maybe_cutmix_batch(
+    rgb: torch.Tensor,
+    rgbd: torch.Tensor,
+    targets: torch.Tensor,
+    alpha: float,
+    prob: float,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if alpha <= 0.0 or prob <= 0.0:
+        return rgb, rgbd, targets
+    if torch.rand(1, device=rgb.device).item() > prob:
+        return rgb, rgbd, targets
+    lam = float(np.random.beta(alpha, alpha))
+    perm = torch.randperm(rgb.size(0), device=rgb.device)
+    _, _, h, w = rgb.shape
+    x1, y1, x2, y2 = _rand_bbox(w, h, lam, rgb.device)
+    rgb[:, :, y1:y2, x1:x2] = rgb[perm, :, y1:y2, x1:x2]
+    rgbd[:, :, y1:y2, x1:x2] = rgbd[perm, :, y1:y2, x1:x2]
+    box_area = (x2 - x1) * (y2 - y1)
+    lam_adjusted = 1.0 - (box_area / float(w * h))
+    targets_mix = lam_adjusted * targets + (1.0 - lam_adjusted) * targets[perm]
+    return rgb, rgbd, targets_mix
 
 
 def apply_block_freezing(blocks: Sequence[nn.Module], frozen_count: int) -> None:
@@ -554,6 +603,7 @@ def train_fusion_regressor(
                 y = batch['dry_weight'].to(device, non_blocking=True)
 
                 rgb, rgbd, y = maybe_mixup_batch(rgb, rgbd, y, cfg.mixup_alpha, cfg.mixup_prob)
+                rgb, rgbd, y = maybe_cutmix_batch(rgb, rgbd, y, cfg.cutmix_alpha, cfg.cutmix_prob)
 
                 optimizer.zero_grad(set_to_none=True)
                 rgb_pred, rgbd_pred, fusion_pred = model(rgb, rgbd)
