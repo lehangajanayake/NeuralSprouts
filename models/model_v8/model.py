@@ -1,4 +1,4 @@
-from typing import Tuple
+from typing import Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -79,6 +79,38 @@ class SpatialAttentionModule(nn.Module):
         attn = self.conv(attn)
         scale = self.activation(attn)
         return x * scale
+
+
+class SpatialAttentionStack(nn.Module):
+    """Stacks multiple spatial attention layers for richer context modeling."""
+
+    def __init__(
+        self,
+        kernel_sizes: Union[int, Tuple[int, ...]] = 5,
+        num_layers: int = 1,
+        dropout: float = 0.0,
+    ):
+        super().__init__()
+        num_layers = max(1, int(num_layers))
+        if isinstance(kernel_sizes, (tuple, list)):
+            kernels = [int(k) for k in kernel_sizes if int(k) > 0]
+        else:
+            kernels = [int(kernel_sizes)]
+        if not kernels:
+            raise ValueError('SpatialAttentionStack requires at least one valid kernel size.')
+        if len(kernels) < num_layers:
+            kernels.extend([kernels[-1]] * (num_layers - len(kernels)))
+        else:
+            kernels = kernels[:num_layers]
+        self.layers = nn.ModuleList(SpatialAttentionModule(kernel_size=k) for k in kernels)
+        self.dropout = nn.Dropout2d(p=float(dropout)) if float(dropout) > 0.0 else nn.Identity()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        out = x
+        for layer in self.layers:
+            out = layer(out)
+            out = self.dropout(out)
+        return out
 
 
 def _drop_rates(num_blocks: int, drop_path_prob: float) -> Tuple[float, ...]:
@@ -203,10 +235,17 @@ class LettuceSAMFusionNet(nn.Module):
         rgb_widths: Tuple[int, ...] = (32, 64, 96, 128),
         rgbd_widths: Tuple[int, ...] = (32, 64, 96, 128),
         embed_dim: int = 256,
-        spatial_kernel: int = 5,
+        spatial_kernel: Union[int, Tuple[int, ...]] = 5,
+        spatial_layers: int = 1,
+        spatial_dropout: float = 0.0,
     ):
         super().__init__()
-        self.shared_spatial_attn = SpatialAttentionModule(kernel_size=spatial_kernel)
+        layers = max(1, int(spatial_layers))
+        self.shared_spatial_attn = SpatialAttentionStack(
+            kernel_sizes=spatial_kernel,
+            num_layers=layers,
+            dropout=spatial_dropout,
+        )
         self.rgb_branch = RGBRegressionBranch(drop_path_prob=drop_path_prob, widths=rgb_widths, embed_dim=embed_dim)
         self.rgbd_branch = RGBDRegressionBranch(drop_path_prob=drop_path_prob, widths=rgbd_widths, embed_dim=embed_dim)
         fusion_in_dim = self.rgb_branch.embedding_dim + self.rgbd_branch.embedding_dim

@@ -53,10 +53,13 @@ class TrainConfig:
     blacklist_ids: Tuple[int, ...] = (163,)
     best_mae_window: int = 5
     ema_decay: float = 0.995
-    drop_path_prob: float = 0.1
+    drop_path_prob: float = 0
     rgb_widths: Tuple[int, ...] = (32, 64, 96, 128)
     rgbd_widths: Tuple[int, ...] = (32, 64, 96, 128)
     embed_dim: int = 256
+    spatial_kernel: Tuple[int, ...] = (3, 5, 7)
+    spatial_layers: int = 3
+    spatial_dropout: float = 0.1
 
     mixup_alpha: float = 0.2
     mixup_prob: float = 0.5
@@ -717,6 +720,9 @@ def main():
             rgb_widths=cfg.rgb_widths,
             rgbd_widths=cfg.rgbd_widths,
             embed_dim=cfg.embed_dim,
+            spatial_kernel=cfg.spatial_kernel,
+            spatial_layers=cfg.spatial_layers,
+            spatial_dropout=cfg.spatial_dropout,
         ).to(device)
         print(f"[train] training fusion regressor ({label})...")
         best_full, train_hist, val_hist, best_val, best_epoch = train_fusion_regressor(
