@@ -66,7 +66,7 @@ class TrainConfig:
     batch_size: int = 256
     num_epochs: int = 100
     lr: float = 1e-3
-    weight_decay: float = 1e-4
+    weight_decay: float = 1e-3
 
     # OneCycleLR schedule — smooth warm-up → cosine decay per batch
     onecycle_max_lr: float = 3e-3
@@ -87,10 +87,10 @@ class TrainConfig:
     drop_path_prob: float = 0.15
     rgb_widths: Tuple[int, ...] = (8, 16, 32, 64)
     rgbd_widths: Tuple[int, ...] = (16, 32, 64, 96)
-    embed_dim: int = 64 + 96
+    embed_dim: int = 64
 
     # ---- regularisation ---------------------------------------------------
-    mixup_alpha: float = 0.2
+    mixup_alpha: float = 0.4
     mixup_prob: float = 0.5
     huber_delta: float = 0.3
     ema_decay: float = 0.995

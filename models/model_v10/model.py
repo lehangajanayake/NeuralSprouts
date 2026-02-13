@@ -209,15 +209,18 @@ class RegressionBranch(nn.Module):
 # ---------------------------------------------------------------------------
 
 class FusionMLP(nn.Module):
-    """Two-hidden-layer MLP that fuses the two branch embeddings."""
+    """Single-hidden-layer MLP that fuses the two branch embeddings.
 
-    def __init__(self, in_dim: int = 512, hidden: int = 256, dropout: float = 0.3) -> None:
+    Defaults *hidden* to ``in_dim // 2`` so the head contracts rather
+    than expands — critical for avoiding overfitting on small datasets.
+    """
+
+    def __init__(self, in_dim: int = 512, hidden: int | None = None, dropout: float = 0.4) -> None:
         super().__init__()
+        if hidden is None:
+            hidden = max(16, in_dim // 2)
         self.net = nn.Sequential(
             nn.Linear(in_dim, hidden),
-            nn.ReLU(inplace=True),
-            nn.Dropout(p=dropout),
-            nn.Linear(hidden, hidden),
             nn.ReLU(inplace=True),
             nn.Dropout(p=dropout),
             nn.Linear(hidden, 1),
@@ -241,6 +244,9 @@ class LettuceSAMFusionNet(nn.Module):
         rgb_widths: Tuple[int, ...] = (32, 64, 96, 128),
         rgbd_widths: Tuple[int, ...] = (32, 64, 96, 128),
         embed_dim: int = 256,
+        branch_dropout: float = 0.3,
+        fusion_hidden: int | None = None,
+        fusion_dropout: float = 0.4,
     ) -> None:
         super().__init__()
         self.rgb_branch = RegressionBranch(
@@ -248,17 +254,22 @@ class LettuceSAMFusionNet(nn.Module):
             widths=rgb_widths,
             drop_path_prob=drop_path_prob,
             embed_dim=embed_dim,
+            dropout=branch_dropout,
         )
         self.rgbd_branch = RegressionBranch(
             in_channels=4,
             widths=rgbd_widths,
             drop_path_prob=drop_path_prob,
             embed_dim=embed_dim,
+            dropout=branch_dropout,
         )
+        fuse_in = self.rgb_branch.embedding_dim + self.rgbd_branch.embedding_dim
         self.fusion = FusionMLP(
-            in_dim=self.rgb_branch.embedding_dim + self.rgbd_branch.embedding_dim,
+            in_dim=fuse_in,
+            hidden=fusion_hidden,
+            dropout=fusion_dropout,
         )
-        self.fusion_in_dropout = nn.Dropout(p=0.2)
+        self.fusion_in_dropout = nn.Dropout(p=0.3)
 
     # ---- forward / inference -------------------------------------------
 
