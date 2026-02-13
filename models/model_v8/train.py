@@ -31,10 +31,10 @@ class TrainConfig:
     rgb_dir: str = '../../datasets/Training/Augmented_v8/RGBImages'
     depth_dir: str = '../../datasets/Training/Augmented_v8/DepthImages'
 
-    batch_size: int = 256
+    batch_size: int = 32
     num_epochs: int = 100
     lr: float = 1e-3
-    weight_decay: float = 1e-4
+    weight_decay: float = 1e-5
     scheduler_factor: float = 0.5
     scheduler_patience: int = 10
     scheduler_min_lr: float = 1e-6
@@ -45,6 +45,7 @@ class TrainConfig:
     outputs_per_original: int = 41
     num_folds: int = 1
     group_by_original: bool = True
+    val_only_originals: bool = True
 
     preload_to_gpu: bool = True
     preload_device: str = 'cuda'
@@ -57,9 +58,9 @@ class TrainConfig:
     rgb_widths: Tuple[int, ...] = (32, 64, 96, 128)
     rgbd_widths: Tuple[int, ...] = (32, 64, 96, 128)
     embed_dim: int = 256
-    spatial_kernel: Tuple[int, ...] = (3, 5, 7)
-    spatial_layers: int = 3
-    spatial_dropout: float = 0.1
+    spatial_kernel: Tuple[int, ...] = (5, 7)
+    spatial_layers: int = 2
+    spatial_dropout: float = 0.3
     share_spatial_attn: bool = False
 
     mixup_alpha: float = 0.2
@@ -335,23 +336,29 @@ def _build_full_dataset(cfg: TrainConfig) -> PlantDatasetV8:
     return dataset
 
 
-def _compute_group_ids(full_df, cfg: TrainConfig) -> Tuple[np.ndarray, bool]:
+def _compute_group_ids(full_df, cfg: TrainConfig) -> Tuple[np.ndarray, bool, np.ndarray | None]:
+    has_original_ids = 'original_id' in full_df.columns
+    original_mask = None
+    if has_original_ids:
+        original_mask = (full_df['id'].astype(int) == full_df['original_id'].astype(int)).to_numpy()
+
     if not cfg.group_by_original:
         ids = np.arange(len(full_df), dtype=int)
-        return ids, False
-    has_original_ids = 'original_id' in full_df.columns
+        return ids, has_original_ids, original_mask
+
     if has_original_ids:
         group_ids = full_df['original_id'].astype(int).to_numpy()
     else:
         outputs_per_original = max(1, int(cfg.outputs_per_original))
         group_ids = ((full_df['id'].astype(int) - 1) // outputs_per_original).to_numpy()
-    return group_ids, has_original_ids
+    return group_ids, has_original_ids, original_mask
 
 
 def _split_group_indices(
     group_ids: np.ndarray,
     cfg: TrainConfig,
     has_original_ids: bool,
+    original_mask: np.ndarray | None,
 ) -> List[Tuple[List[int], List[int]]]:
     unique_groups = np.unique(group_ids)
     total_groups = len(unique_groups)
@@ -373,6 +380,10 @@ def _split_group_indices(
             val_set = set(int(g) for g in val_groups)
             train_idx = [int(i) for i, g in enumerate(group_ids) if g not in val_set]
             val_idx = [int(i) for i, g in enumerate(group_ids) if g in val_set]
+            if cfg.val_only_originals:
+                if not has_original_ids or original_mask is None:
+                    raise ValueError('val_only_originals requires original_id column in the CSV.')
+                val_idx = [idx for idx in val_idx if bool(original_mask[idx])]
             if not train_idx or not val_idx:
                 raise ValueError(f'Fold {fold_id} is empty. Reduce num_folds or ensure more originals are available.')
             splits.append((train_idx, val_idx))
@@ -385,6 +396,10 @@ def _split_group_indices(
         val_group_ids = set(unique_groups[:val_group_count])
         train_idx = [int(i) for i, g in enumerate(group_ids) if g not in val_group_ids]
         val_idx = [int(i) for i, g in enumerate(group_ids) if g in val_group_ids]
+        if cfg.val_only_originals:
+            if not has_original_ids or original_mask is None:
+                raise ValueError('val_only_originals requires original_id column in the CSV.')
+            val_idx = [idx for idx in val_idx if bool(original_mask[idx])]
         if not train_idx or not val_idx:
             hint = 'Ensure original_id exists in the CSV' if has_original_ids else 'Adjust val_ratio or outputs_per_original'
             raise ValueError(f'Group-based split resulted in empty train/val set. {hint}.')
@@ -454,8 +469,8 @@ def _build_dataloaders_from_indices(
 
 def make_fold_loaders(cfg: TrainConfig) -> List[Tuple[DataLoader, DataLoader, str]]:
     full = _build_full_dataset(cfg)
-    group_ids, has_original_ids = _compute_group_ids(full.df, cfg)
-    splits = _split_group_indices(group_ids, cfg, has_original_ids)
+    group_ids, has_original_ids, original_mask = _compute_group_ids(full.df, cfg)
+    splits = _split_group_indices(group_ids, cfg, has_original_ids, original_mask)
 
     full.build_cache(max_base_items=None)
 
@@ -512,7 +527,7 @@ def save_training_curves(train_history: List[float], val_history: List[float], o
         best_val = val_history[best_epoch - 1]
         ax.scatter([best_epoch], [best_val], color='red', s=40, label=f'Best epoch {best_epoch}')
         ax.legend()
-        fig.savefig(out_path, dpi=150, bbox_inches='tight')
+    fig.savefig(out_path, dpi=150, bbox_inches='tight')
     plt.close(fig)
     print(f'Saved training curves to: {out_path}')
 

@@ -216,6 +216,7 @@ __marimo__/
 /datasets/Training/AugmentedMixup/
 /datasets/Test/Augmented/
 /datasets/Training/Augmented_v8
+#exclude shards
 Test_with_predictions.csv
 
 
