@@ -338,9 +338,18 @@ def _build_full_dataset(cfg: TrainConfig) -> PlantDatasetV8:
 
 def _compute_group_ids(full_df, cfg: TrainConfig) -> Tuple[np.ndarray, bool, np.ndarray | None]:
     has_original_ids = 'original_id' in full_df.columns
-    original_mask = None
-    if has_original_ids:
-        original_mask = (full_df['id'].astype(int) == full_df['original_id'].astype(int)).to_numpy()
+    original_mask: np.ndarray | None = None
+
+    if cfg.val_only_originals:
+        if not has_original_ids:
+            raise ValueError('val_only_originals requires original_id column in the CSV.')
+        if 'is_original' in full_df.columns:
+            original_mask = full_df['is_original'].astype(bool).to_numpy()
+        elif 'shard_index' in full_df.columns:
+            original_mask = (full_df['shard_index'].astype(int) == 0).to_numpy()
+        else:
+            originals = ~full_df['original_id'].astype(int).duplicated(keep='first')
+            original_mask = originals.to_numpy()
 
     if not cfg.group_by_original:
         ids = np.arange(len(full_df), dtype=int)
