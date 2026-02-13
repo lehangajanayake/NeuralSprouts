@@ -21,7 +21,7 @@ class DropPath(nn.Module):
 
 
 class BottleneckBlock(nn.Module):
-    """1x1 -> 5x5 -> 1x1 bottleneck with residual + pooling."""
+    """1x1 -> 3x3 -> 1x1 bottleneck with residual + pooling."""
 
     def __init__(self, in_ch: int, out_ch: int, *, reduction: int = 4, drop_prob: float = 0.0):
         super().__init__()
