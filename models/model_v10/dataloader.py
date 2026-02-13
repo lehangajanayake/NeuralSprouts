@@ -172,7 +172,7 @@ class PlantDatasetV10(Dataset):
         depth_dir: str,
         labels_csv: str,
         *,
-        image_size: int = 96,
+        image_size: int = 128,
         center_crop: bool = True,
         blacklist_ids: Optional[Sequence[int]] = None,
     ) -> None:
@@ -235,7 +235,7 @@ class TestPlantDataset(Dataset):
         depth_dir: str,
         csv_file: str,
         *,
-        image_size: int = 96,
+        image_size: int = 128,
         center_crop: bool = True,
         blacklist_ids: Optional[Sequence[int]] = None,
     ) -> None:

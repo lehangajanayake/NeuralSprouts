@@ -25,7 +25,7 @@ class PredictConfig:
     test_depth: str = "../../datasets/Test/DepthImages"
     test_csv: str = "../../datasets/Test/Test.csv"
     checkpoint: str = "best_model_v10.pth"
-    image_size: int = 96
+    image_size: int = 128
     output_csv: str = "Test_with_predictions_v10.csv"
     batch_size: int = 64
     blacklist_ids: Tuple[int, ...] = (163,)

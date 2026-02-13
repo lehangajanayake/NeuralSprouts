@@ -63,7 +63,7 @@ class TrainConfig:
     manifest_csv: str = "../../datasets/Training/Shards_v10/manifest.csv"
 
     # ---- training ---------------------------------------------------------
-    batch_size: int = 256
+    batch_size: int = 128
     num_epochs: int = 200
     lr: float = 1e-3
     weight_decay: float = 1e-3

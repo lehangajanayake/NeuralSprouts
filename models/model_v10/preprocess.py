@@ -61,7 +61,7 @@ class PreprocessConfig:
     out_csv: str = "../../datasets/Training/Shards_v10/manifest.csv"
 
     # ---- geometry ---------------------------------------------------------
-    image_size: int = 96
+    image_size: int = 128
     crop_size: int = 1000
     randomize_crop: bool = False
     max_center_shift: int = 0  # disabled — affine translate handles positional jitter
