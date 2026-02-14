@@ -73,7 +73,7 @@ class TrainConfig:
 
     # ---- split / fold -----------------------------------------------------
     labels_csv: str = "../../datasets/Training/Train.csv"  # for variety + weight info
-    val_per_cell: int = 2  # original images per (variety × weight-regime) cell in val
+    val_per_cell: int = 2  # originals per (variety × regime) cell in val
     val_ratio: float = 0.2
     seed: int = 43
     patience: int = 150
@@ -89,7 +89,7 @@ class TrainConfig:
     # ---- regularisation ---------------------------------------------------
     mixup_alpha: float = 0.1
     mixup_prob: float = 0.0
-    huber_delta: float = 0.3
+    huber_delta: float = 2.0
     ema_decay: float = 0.995
 
     # ---- phased branch-wise pretraining -----------------------------------
@@ -264,7 +264,41 @@ def _split_by_group(
             "Stratified split produced an empty train or val set. "
             "Lower val_per_cell or check your data."
         )
-    return [(train_idx, val_idx)]
+    return [(train_idx, val_idx)], (q33, q67)
+
+
+# ---------------------------------------------------------------------------
+# Regime-aware sample weighting
+# ---------------------------------------------------------------------------
+
+# Weights per regime: heavy plants are under-represented AND systematically
+# under-predicted, so they get a larger loss weight.
+REGIME_WEIGHTS = {"low": 1.0, "mid": 1.0, "high": 2.0}
+
+
+def _compute_sample_weights(
+    targets: torch.Tensor,
+    q33: float,
+    q67: float,
+    device: torch.device,
+) -> torch.Tensor:
+    """Return a weight tensor (same length as *targets*) based on weight regime.
+
+    Heavy plants (> q67) get ``REGIME_WEIGHTS['high']`` = 2×,
+    others get 1×.  Weights are normalised so the mean = 1.0.
+    """
+    w = torch.ones(len(targets), dtype=torch.float32)
+    t_np = targets.cpu().numpy() if targets.is_cuda else targets.numpy()
+    for i, t in enumerate(t_np):
+        if t > q67:
+            w[i] = REGIME_WEIGHTS["high"]
+        elif t > q33:
+            w[i] = REGIME_WEIGHTS["mid"]
+        else:
+            w[i] = REGIME_WEIGHTS["low"]
+    # Normalise so mean weight = 1.0 (doesn't change effective LR)
+    w = w / w.mean()
+    return w.to(device)
 
 
 # ---------------------------------------------------------------------------
@@ -357,6 +391,9 @@ def _run_phase(  # noqa: C901
     eval_metric: str = "fused",
     branch_lr_scale: float = 1.0,
     phase_boundaries: Optional[List[int]] = None,
+    sample_weights: Optional[torch.Tensor] = None,
+    q33: float = 0.0,
+    q67: float = 0.0,
 ) -> Tuple[float, Optional[int]]:
     """Run one training phase (branch pretrain or joint fine-tune).
 
@@ -370,11 +407,23 @@ def _run_phase(  # noqa: C901
         Multiply the LR for branch parameters by this factor.  Use < 1.0
         in Phase 3 so pretrained branches don't drift while fusion trains.
     phase_boundaries : list of epoch indices where phases change (for plotting).
+    sample_weights : optional per-sample loss multiplier (e.g. regime weights).
+    q33 / q67 : tercile boundaries for regime weighting.
     """
+    # Use reduction='none' so we can apply per-sample regime weights
     criterion = (
-        nn.SmoothL1Loss(beta=cfg.huber_delta) if cfg.huber_delta > 0 else nn.L1Loss()
+        nn.SmoothL1Loss(beta=cfg.huber_delta, reduction="none")
+        if cfg.huber_delta > 0 else nn.L1Loss(reduction="none")
     )
     rgb_w, rgbd_w, fusion_w = loss_weights
+    # Enable regime weighting if tercile boundaries are provided
+    use_sample_weights = (q67 > 0)
+    _q33 = q33
+    _q67 = q67
+    if use_sample_weights:
+        print(f"  Regime weighting: low(<{_q33:.2f})=×{REGIME_WEIGHTS['low']:.1f}  "
+              f"mid=×{REGIME_WEIGHTS['mid']:.1f}  "
+              f"high(>{_q67:.2f})=×{REGIME_WEIGHTS['high']:.1f}")
 
     # Build parameter groups with differential LR for branches vs fusion
     branch_params = [p for n, p in model.named_parameters()
@@ -430,6 +479,7 @@ def _run_phase(  # noqa: C901
     use_ema = ema_model is not None
     accum = max(1, cfg.grad_accum_steps)
     global_epoch_offset = len(train_hist)  # for display numbering
+    best_raw_val = float("inf")  # track lowest single-epoch val MAE for saving
 
     try:
         for ep in range(num_epochs):
@@ -448,14 +498,23 @@ def _run_phase(  # noqa: C901
 
                 with torch.amp.autocast("cuda", enabled=amp_enabled, dtype=amp_dtype):
                     rp, dp, fp = model(rgb, rgbd)
-                    loss = 0.0
+                    # Element-wise losses (reduction='none')
+                    per_sample = torch.zeros_like(y)
                     if rgb_w > 0:
-                        loss = loss + rgb_w * criterion(rp, y)
+                        per_sample = per_sample + rgb_w * criterion(rp, y)
                     if rgbd_w > 0:
-                        loss = loss + rgbd_w * criterion(dp, y)
+                        per_sample = per_sample + rgbd_w * criterion(dp, y)
                     if fusion_w > 0:
-                        loss = loss + fusion_w * criterion(fp, y)
-                    loss = loss / accum
+                        per_sample = per_sample + fusion_w * criterion(fp, y)
+                    # Apply regime weights: heavy plants get ~2× gradient
+                    if use_sample_weights:
+                        sw = torch.ones_like(y)
+                        sw[y > _q67] = REGIME_WEIGHTS["high"]
+                        sw[(y >= _q33) & (y <= _q67)] = REGIME_WEIGHTS["mid"]
+                        sw[y < _q33] = REGIME_WEIGHTS["low"]
+                        sw = sw / sw.mean().clamp(min=1e-6)
+                        per_sample = per_sample * sw
+                    loss = per_sample.mean() / accum
 
                 scaler.scale(loss).backward()
 
@@ -510,17 +569,21 @@ def _run_phase(  # noqa: C901
                 f"smooth({span})={smooth:.4f}"
             )
 
-            # Checkpoint on improvement (only save during phase 3 / joint,
-            # or if we're in a branch phase and it improves)
-            if smooth < best_smooth:
-                best_smooth = smooth
+            # Save checkpoint when raw val MAE improves (not smooth)
+            # This ensures the saved model is truly the best single epoch.
+            if v_mae < best_raw_val:
+                best_raw_val = v_mae
                 target = ema_model if use_ema and ema_model is not None else model
                 _save(best_path, target)
                 best_epoch = global_ep
-                print(f"    ★ saved best model (smooth={smooth:.4f})")
+                print(f"    ★ saved best model (val_mae={v_mae:.4f})")
+
+            # Track smooth for early stopping only
+            if smooth < best_smooth:
+                best_smooth = smooth
 
             if stopper is not None and stopper.step(smooth):
-                print(f"  early stop at epoch {ep+1} (best_smooth={best_smooth:.4f})")
+                print(f"  early stop at epoch {ep+1} (best_val={best_raw_val:.4f}  best_smooth={best_smooth:.4f})")
                 break
 
             if (ep + 1) % 5 == 0 or (ep + 1) == num_epochs:
@@ -529,9 +592,18 @@ def _run_phase(  # noqa: C901
                              phase_boundaries=phase_boundaries)
 
     except KeyboardInterrupt:
-        print(f"\n  interrupted during {phase_name} — saving checkpoint…")
+        # Save current state to a SEPARATE file — never overwrite the best checkpoint
+        last_path = best_path.replace("best_model", "last_model")
+        target = ema_model if use_ema and ema_model is not None else model
+        _save(last_path, target)
+        print(f"\n  interrupted during {phase_name} — saved current state → {last_path}")
+        print(f"  (best checkpoint untouched at {best_path}, val_mae={best_raw_val:.4f})")
+
+    # If no checkpoint was ever saved (e.g. val never improved), save current state
+    if not os.path.exists(best_path):
         target = ema_model if use_ema and ema_model is not None else model
         _save(best_path, target)
+        print(f"  (no improvement recorded — saved current state as fallback)")
 
     _save_curves(train_hist, val_hist, cfg.out_dir,
                  suffix=curves_suffix, best_ep=best_epoch,
@@ -548,6 +620,8 @@ def _train_one_fold(  # noqa: C901
     device: torch.device,
     fold_suffix: str = "",
     fold_label: str = "",
+    q33: float = 0.0,
+    q67: float = 0.0,
 ) -> Tuple[str, List[float], List[float], float, Optional[int]]:
     best_name = f"best_model_v10{fold_suffix}.pth"
     best_path = str(Path(cfg.out_dir) / best_name)
@@ -586,6 +660,7 @@ def _train_one_fold(  # noqa: C901
         use_early_stop=False,
         eval_metric="rgb",
         phase_boundaries=phase_boundaries,
+        q33=q33, q67=q67,
     )
     phase_boundaries.append(len(train_hist))  # mark Phase 1 → 2 boundary
 
@@ -609,6 +684,7 @@ def _train_one_fold(  # noqa: C901
         use_early_stop=False,
         eval_metric="rgbd",
         phase_boundaries=phase_boundaries,
+        q33=q33, q67=q67,
     )
     phase_boundaries.append(len(train_hist))  # mark Phase 2 → 3 boundary
 
@@ -639,6 +715,7 @@ def _train_one_fold(  # noqa: C901
         eval_metric="fused",
         branch_lr_scale=cfg.phase3_branch_lr_scale,
         phase_boundaries=phase_boundaries,
+        q33=q33, q67=q67,
     )
 
     # Ensure at least one checkpoint exists
@@ -685,7 +762,10 @@ def main() -> None:
         ds.to_device(device)
         print(f"[train] pre-loaded dataset to {device}")
 
-    splits = _split_by_group(orig_ids, cfg)
+    splits, (q33, q67) = _split_by_group(orig_ids, cfg)
+    print(f"[train] regime boundaries: q33={q33:.3f}  q67={q67:.3f}")
+    print(f"[train] regime weights: low=×{REGIME_WEIGHTS['low']:.1f}  "
+          f"mid=×{REGIME_WEIGHTS['mid']:.1f}  high=×{REGIME_WEIGHTS['high']:.1f}")
     total_folds = len(splits)
     results: List[Tuple[str, str, float]] = []
 
@@ -725,6 +805,7 @@ def main() -> None:
         best_path, t_hist, v_hist, best_val, best_ep = _train_one_fold(
             cfg, model, train_loader, val_loader, device,
             fold_suffix=suffix, fold_label=label,
+            q33=q33, q67=q67,
         )
         # Curves are already saved inside _train_one_fold (periodically + at end)
         results.append((label, best_path, best_val))
