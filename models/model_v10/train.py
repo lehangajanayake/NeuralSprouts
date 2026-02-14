@@ -89,8 +89,9 @@ class TrainConfig:
     # ---- regularisation ---------------------------------------------------
     mixup_alpha: float = 0.1
     mixup_prob: float = 0.0
-    huber_delta: float = 2.0
+    huber_delta: float = 0.5   # in log-space; ~0.5 is a good default
     ema_decay: float = 0.995
+    log_targets: bool = True   # train in log1p(y) space to fix heavy-plant under-prediction
 
     # ---- phased branch-wise pretraining -----------------------------------
     # Phase 1: train RGB branch alone (RGBD + fusion frozen)
@@ -264,41 +265,7 @@ def _split_by_group(
             "Stratified split produced an empty train or val set. "
             "Lower val_per_cell or check your data."
         )
-    return [(train_idx, val_idx)], (q33, q67)
-
-
-# ---------------------------------------------------------------------------
-# Regime-aware sample weighting
-# ---------------------------------------------------------------------------
-
-# Weights per regime: heavy plants are under-represented AND systematically
-# under-predicted, so they get a larger loss weight.
-REGIME_WEIGHTS = {"low": 1.0, "mid": 1.0, "high": 2.0}
-
-
-def _compute_sample_weights(
-    targets: torch.Tensor,
-    q33: float,
-    q67: float,
-    device: torch.device,
-) -> torch.Tensor:
-    """Return a weight tensor (same length as *targets*) based on weight regime.
-
-    Heavy plants (> q67) get ``REGIME_WEIGHTS['high']`` = 2×,
-    others get 1×.  Weights are normalised so the mean = 1.0.
-    """
-    w = torch.ones(len(targets), dtype=torch.float32)
-    t_np = targets.cpu().numpy() if targets.is_cuda else targets.numpy()
-    for i, t in enumerate(t_np):
-        if t > q67:
-            w[i] = REGIME_WEIGHTS["high"]
-        elif t > q33:
-            w[i] = REGIME_WEIGHTS["mid"]
-        else:
-            w[i] = REGIME_WEIGHTS["low"]
-    # Normalise so mean weight = 1.0 (doesn't change effective LR)
-    w = w / w.mean()
-    return w.to(device)
+    return [(train_idx, val_idx)]
 
 
 # ---------------------------------------------------------------------------
@@ -391,9 +358,6 @@ def _run_phase(  # noqa: C901
     eval_metric: str = "fused",
     branch_lr_scale: float = 1.0,
     phase_boundaries: Optional[List[int]] = None,
-    sample_weights: Optional[torch.Tensor] = None,
-    q33: float = 0.0,
-    q67: float = 0.0,
 ) -> Tuple[float, Optional[int]]:
     """Run one training phase (branch pretrain or joint fine-tune).
 
@@ -407,23 +371,11 @@ def _run_phase(  # noqa: C901
         Multiply the LR for branch parameters by this factor.  Use < 1.0
         in Phase 3 so pretrained branches don't drift while fusion trains.
     phase_boundaries : list of epoch indices where phases change (for plotting).
-    sample_weights : optional per-sample loss multiplier (e.g. regime weights).
-    q33 / q67 : tercile boundaries for regime weighting.
     """
-    # Use reduction='none' so we can apply per-sample regime weights
     criterion = (
-        nn.SmoothL1Loss(beta=cfg.huber_delta, reduction="none")
-        if cfg.huber_delta > 0 else nn.L1Loss(reduction="none")
+        nn.SmoothL1Loss(beta=cfg.huber_delta) if cfg.huber_delta > 0 else nn.L1Loss()
     )
     rgb_w, rgbd_w, fusion_w = loss_weights
-    # Enable regime weighting if tercile boundaries are provided
-    use_sample_weights = (q67 > 0)
-    _q33 = q33
-    _q67 = q67
-    if use_sample_weights:
-        print(f"  Regime weighting: low(<{_q33:.2f})=×{REGIME_WEIGHTS['low']:.1f}  "
-              f"mid=×{REGIME_WEIGHTS['mid']:.1f}  "
-              f"high(>{_q67:.2f})=×{REGIME_WEIGHTS['high']:.1f}")
 
     # Build parameter groups with differential LR for branches vs fusion
     branch_params = [p for n, p in model.named_parameters()
@@ -493,28 +445,21 @@ def _run_phase(  # noqa: C901
             for step, batch in enumerate(train_loader):
                 rgb = batch["rgb"].to(device, non_blocking=True)
                 rgbd = batch["rgbd"].to(device, non_blocking=True)
-                y = batch["dry_weight"].to(device, non_blocking=True)
+                y_raw = batch["dry_weight"].to(device, non_blocking=True)
+                # Log-transform targets: model predicts in log1p space
+                y = torch.log1p(y_raw) if cfg.log_targets else y_raw
                 rgb, rgbd, y = _maybe_mixup(rgb, rgbd, y, cfg.mixup_alpha, cfg.mixup_prob)
 
                 with torch.amp.autocast("cuda", enabled=amp_enabled, dtype=amp_dtype):
                     rp, dp, fp = model(rgb, rgbd)
-                    # Element-wise losses (reduction='none')
-                    per_sample = torch.zeros_like(y)
+                    loss = 0.0
                     if rgb_w > 0:
-                        per_sample = per_sample + rgb_w * criterion(rp, y)
+                        loss = loss + rgb_w * criterion(rp, y)
                     if rgbd_w > 0:
-                        per_sample = per_sample + rgbd_w * criterion(dp, y)
+                        loss = loss + rgbd_w * criterion(dp, y)
                     if fusion_w > 0:
-                        per_sample = per_sample + fusion_w * criterion(fp, y)
-                    # Apply regime weights: heavy plants get ~2× gradient
-                    if use_sample_weights:
-                        sw = torch.ones_like(y)
-                        sw[y > _q67] = REGIME_WEIGHTS["high"]
-                        sw[(y >= _q33) & (y <= _q67)] = REGIME_WEIGHTS["mid"]
-                        sw[y < _q33] = REGIME_WEIGHTS["low"]
-                        sw = sw / sw.mean().clamp(min=1e-6)
-                        per_sample = per_sample * sw
-                    loss = per_sample.mean() / accum
+                        loss = loss + fusion_w * criterion(fp, y)
+                    loss = loss / accum
 
                 scaler.scale(loss).backward()
 
@@ -527,13 +472,20 @@ def _run_phase(  # noqa: C901
                         _update_ema(ema_model, model, cfg.ema_decay)
 
                 bs = y.size(0)
-                # Track MAE from the relevant prediction
-                if eval_metric == "rgb":
-                    t_mae_sum += torch.mean(torch.abs(rp.detach() - y)).item() * bs
-                elif eval_metric == "rgbd":
-                    t_mae_sum += torch.mean(torch.abs(dp.detach() - y)).item() * bs
+                # Track MAE in *original* grams (invert log-space predictions)
+                if cfg.log_targets:
+                    rp_g = torch.expm1(rp.detach())
+                    dp_g = torch.expm1(dp.detach())
+                    fp_g = torch.expm1(fp.detach())
+                    y_g = y_raw
                 else:
-                    t_mae_sum += torch.mean(torch.abs(fp.detach() - y)).item() * bs
+                    rp_g, dp_g, fp_g, y_g = rp.detach(), dp.detach(), fp.detach(), y
+                if eval_metric == "rgb":
+                    t_mae_sum += torch.mean(torch.abs(rp_g - y_g)).item() * bs
+                elif eval_metric == "rgbd":
+                    t_mae_sum += torch.mean(torch.abs(dp_g - y_g)).item() * bs
+                else:
+                    t_mae_sum += torch.mean(torch.abs(fp_g - y_g)).item() * bs
                 n_t += bs
 
             # ---- validate ----------------------------------------------
@@ -543,16 +495,24 @@ def _run_phase(  # noqa: C901
                 for batch in val_loader:
                     rgb_b = batch["rgb"].to(device, non_blocking=True)
                     rgbd_b = batch["rgbd"].to(device, non_blocking=True)
-                    y_b = batch["dry_weight"].to(device, non_blocking=True)
+                    y_raw_b = batch["dry_weight"].to(device, non_blocking=True)
                     with torch.amp.autocast("cuda", enabled=amp_enabled, dtype=amp_dtype):
                         rp, dp, fp = model(rgb_b, rgbd_b)
-                    bs = y_b.size(0)
-                    if eval_metric == "rgb":
-                        v_mae_sum += torch.mean(torch.abs(rp - y_b)).item() * bs
-                    elif eval_metric == "rgbd":
-                        v_mae_sum += torch.mean(torch.abs(dp - y_b)).item() * bs
+                    bs = y_raw_b.size(0)
+                    # Val MAE always in original grams
+                    if cfg.log_targets:
+                        rp_g = torch.expm1(rp)
+                        dp_g = torch.expm1(dp)
+                        fp_g = torch.expm1(fp)
+                        y_g = y_raw_b
                     else:
-                        v_mae_sum += torch.mean(torch.abs(fp - y_b)).item() * bs
+                        rp_g, dp_g, fp_g, y_g = rp, dp, fp, y_raw_b
+                    if eval_metric == "rgb":
+                        v_mae_sum += torch.mean(torch.abs(rp_g - y_g)).item() * bs
+                    elif eval_metric == "rgbd":
+                        v_mae_sum += torch.mean(torch.abs(dp_g - y_g)).item() * bs
+                    else:
+                        v_mae_sum += torch.mean(torch.abs(fp_g - y_g)).item() * bs
                     n_v += bs
 
             t_mae = t_mae_sum / max(1, n_t)
@@ -620,8 +580,6 @@ def _train_one_fold(  # noqa: C901
     device: torch.device,
     fold_suffix: str = "",
     fold_label: str = "",
-    q33: float = 0.0,
-    q67: float = 0.0,
 ) -> Tuple[str, List[float], List[float], float, Optional[int]]:
     best_name = f"best_model_v10{fold_suffix}.pth"
     best_path = str(Path(cfg.out_dir) / best_name)
@@ -660,7 +618,6 @@ def _train_one_fold(  # noqa: C901
         use_early_stop=False,
         eval_metric="rgb",
         phase_boundaries=phase_boundaries,
-        q33=q33, q67=q67,
     )
     phase_boundaries.append(len(train_hist))  # mark Phase 1 → 2 boundary
 
@@ -684,7 +641,6 @@ def _train_one_fold(  # noqa: C901
         use_early_stop=False,
         eval_metric="rgbd",
         phase_boundaries=phase_boundaries,
-        q33=q33, q67=q67,
     )
     phase_boundaries.append(len(train_hist))  # mark Phase 2 → 3 boundary
 
@@ -715,7 +671,6 @@ def _train_one_fold(  # noqa: C901
         eval_metric="fused",
         branch_lr_scale=cfg.phase3_branch_lr_scale,
         phase_boundaries=phase_boundaries,
-        q33=q33, q67=q67,
     )
 
     # Ensure at least one checkpoint exists
@@ -742,7 +697,8 @@ def main() -> None:
     total_epochs = cfg.phase1_epochs + cfg.phase2_epochs + cfg.phase3_epochs
     print(f"[train] device={device}  AMP={cfg.use_amp and device.type == 'cuda'}  "
           f"compile={cfg.use_compile}  grad_accum={cfg.grad_accum_steps}  "
-          f"gpu_preload={cfg.preload_to_gpu and device.type == 'cuda'}")
+          f"gpu_preload={cfg.preload_to_gpu and device.type == 'cuda'}  "
+          f"log_targets={cfg.log_targets}")
     print(f"[train] 3-phase training: {cfg.phase1_epochs} (RGB) + {cfg.phase2_epochs} (RGBD) "
           f"+ {cfg.phase3_epochs} (joint) = {total_epochs} total epochs")
 
@@ -762,10 +718,7 @@ def main() -> None:
         ds.to_device(device)
         print(f"[train] pre-loaded dataset to {device}")
 
-    splits, (q33, q67) = _split_by_group(orig_ids, cfg)
-    print(f"[train] regime boundaries: q33={q33:.3f}  q67={q67:.3f}")
-    print(f"[train] regime weights: low=×{REGIME_WEIGHTS['low']:.1f}  "
-          f"mid=×{REGIME_WEIGHTS['mid']:.1f}  high=×{REGIME_WEIGHTS['high']:.1f}")
+    splits = _split_by_group(orig_ids, cfg)
     total_folds = len(splits)
     results: List[Tuple[str, str, float]] = []
 
@@ -792,6 +745,7 @@ def main() -> None:
             rgb_widths=cfg.rgb_widths,
             rgbd_widths=cfg.rgbd_widths,
             embed_dim=cfg.embed_dim,
+            log_targets=cfg.log_targets,
         ).to(device)
 
         if cfg.use_compile:
@@ -805,7 +759,6 @@ def main() -> None:
         best_path, t_hist, v_hist, best_val, best_ep = _train_one_fold(
             cfg, model, train_loader, val_loader, device,
             fold_suffix=suffix, fold_label=label,
-            q33=q33, q67=q67,
         )
         # Curves are already saved inside _train_one_fold (periodically + at end)
         results.append((label, best_path, best_val))

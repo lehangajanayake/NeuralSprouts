@@ -41,6 +41,7 @@ class EvalConfig:
     seed: int = 42
     center_crop: bool = True
     blacklist_ids: Tuple[int, ...] = (163,)
+    log_targets: bool = True   # must match training setting
 
     plot_path: str = "eval_predictions_v10.png"
     errors_csv: str = "eval_predictions_v10.csv"
@@ -57,7 +58,9 @@ def main(cfg: Optional[EvalConfig] = None) -> None:
     )
     loader = DataLoader(ds, batch_size=cfg.batch_size, shuffle=False, num_workers=0)
 
-    model = LettuceSAMFusionNet.from_checkpoint(cfg.checkpoint, device=device)
+    model = LettuceSAMFusionNet.from_checkpoint(
+        cfg.checkpoint, device=device, log_targets=cfg.log_targets,
+    )
     model.eval()
 
     mae_fn = nn.L1Loss(reduction="sum")
@@ -73,6 +76,9 @@ def main(cfg: Optional[EvalConfig] = None) -> None:
             y = batch["dry_weight"].to(device)
             sid = batch["id"]
             _, _, fp = model(rgb, rgbd)
+            # Convert log-space predictions back to grams
+            if cfg.log_targets:
+                fp = torch.expm1(fp)
             total_abs += mae_fn(fp, y).item()
             total_n += y.size(0)
             preds.extend(fp.cpu().numpy().ravel().tolist())

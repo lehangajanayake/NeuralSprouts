@@ -247,8 +247,11 @@ class LettuceSAMFusionNet(nn.Module):
         branch_dropout: float = 0.15,
         fusion_hidden: int | None = None,
         fusion_dropout: float = 0.25,
+        log_targets: bool = False,
     ) -> None:
         super().__init__()
+        # Register as buffer so it's saved in state_dict and auto-restored
+        self.register_buffer("_log_targets", torch.tensor(bool(log_targets)))
         self.rgb_branch = RegressionBranch(
             in_channels=3,
             widths=rgb_widths,
@@ -271,6 +274,11 @@ class LettuceSAMFusionNet(nn.Module):
         )
         self.fusion_in_dropout = nn.Dropout(p=0.15)
 
+    @property
+    def log_targets(self) -> bool:
+        """Whether the model was trained with log1p-transformed targets."""
+        return bool(self._log_targets.item())
+
     # ---- forward / inference -------------------------------------------
 
     def forward(
@@ -283,8 +291,15 @@ class LettuceSAMFusionNet(nn.Module):
 
     @torch.no_grad()
     def predict_dry_weight(self, rgb: torch.Tensor, rgbd: torch.Tensor) -> torch.Tensor:
+        """Run inference and return predictions in original grams.
+
+        If the model was trained with ``log_targets=True``, this applies
+        ``expm1`` to convert from log-space back to grams.
+        """
         self.eval()
         _, _, pred = self.forward(rgb, rgbd)
+        if self.log_targets:
+            pred = torch.expm1(pred)
         return pred
 
     # ---- checkpoint helpers --------------------------------------------
@@ -316,11 +331,14 @@ class LettuceSAMFusionNet(nn.Module):
         *,
         device: torch.device | str = "cpu",
         drop_path_prob: float = 0.1,
+        log_targets: bool = True,
     ) -> "LettuceSAMFusionNet":
         """Instantiate a model and load weights from *path*.
 
         Branch widths and embed dim are inferred automatically so the caller
         never needs to hard-code architecture hyper-parameters.
+        If the checkpoint contains a ``_log_targets`` buffer, that value is
+        used; otherwise *log_targets* kwarg is applied.
         """
         state = torch.load(path, map_location=device, weights_only=True)
         rgb_widths = cls.infer_branch_widths(state, "rgb_branch")
@@ -328,11 +346,15 @@ class LettuceSAMFusionNet(nn.Module):
         # Infer embed_dim from the regressor weight shape
         embed_key = "rgb_branch.regressor.weight"
         embed_dim = int(state[embed_key].shape[1]) if embed_key in state else 256
+        # Auto-detect log_targets from checkpoint (falls back to kwarg)
+        if "_log_targets" in state:
+            log_targets = bool(state["_log_targets"].item())
         model = cls(
             drop_path_prob=drop_path_prob,
             rgb_widths=rgb_widths,
             rgbd_widths=rgbd_widths,
             embed_dim=embed_dim,
+            log_targets=log_targets,
         )
         model.load_state_dict(state)
         return model.to(device)

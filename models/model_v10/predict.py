@@ -29,6 +29,7 @@ class PredictConfig:
     output_csv: str = "Test_with_predictions_v10.csv"
     batch_size: int = 64
     blacklist_ids: Tuple[int, ...] = (163,)
+    log_targets: bool = True   # must match training setting
     seed: int = 42
 
 
@@ -52,7 +53,9 @@ def predict_and_save(cfg: Optional[PredictConfig] = None) -> None:
         pin_memory=torch.cuda.is_available(),
     )
 
-    model = LettuceSAMFusionNet.from_checkpoint(cfg.checkpoint, device=device)
+    model = LettuceSAMFusionNet.from_checkpoint(
+        cfg.checkpoint, device=device, log_targets=cfg.log_targets,
+    )
     model.eval()
 
     predictions: dict[int, float] = {}
