@@ -485,7 +485,7 @@ def build_app():
             "Train the model first or update the CHECKPOINT path at the top of this script."
         )
 
-    model = LettuceSAMFusionNet.from_checkpoint(CHECKPOINT, device=device, log_targets=True)
+    model = LettuceSAMFusionNet.from_checkpoint(CHECKPOINT, device=device)
     model.eval()
 
     capture = ActivationCapture()

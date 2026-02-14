@@ -89,9 +89,9 @@ class TrainConfig:
     # ---- regularisation ---------------------------------------------------
     mixup_alpha: float = 0.1
     mixup_prob: float = 0.0
-    huber_delta: float = 0.5   # in log-space; ~0.5 is a good default
+    huber_delta: float = 2.0
     ema_decay: float = 0.995
-    log_targets: bool = True   # train in log1p(y) space to fix heavy-plant under-prediction
+    standardize_targets: bool = True  # z-score targets → mean=0, std=1
 
     # ---- phased branch-wise pretraining -----------------------------------
     # Phase 1: train RGB branch alone (RGBD + fusion frozen)
@@ -446,8 +446,8 @@ def _run_phase(  # noqa: C901
                 rgb = batch["rgb"].to(device, non_blocking=True)
                 rgbd = batch["rgbd"].to(device, non_blocking=True)
                 y_raw = batch["dry_weight"].to(device, non_blocking=True)
-                # Log-transform targets: model predicts in log1p space
-                y = torch.log1p(y_raw) if cfg.log_targets else y_raw
+                # Standardize targets: model predicts in z-score space
+                y = model.standardize(y_raw) if cfg.standardize_targets else y_raw
                 rgb, rgbd, y = _maybe_mixup(rgb, rgbd, y, cfg.mixup_alpha, cfg.mixup_prob)
 
                 with torch.amp.autocast("cuda", enabled=amp_enabled, dtype=amp_dtype):
@@ -472,11 +472,11 @@ def _run_phase(  # noqa: C901
                         _update_ema(ema_model, model, cfg.ema_decay)
 
                 bs = y.size(0)
-                # Track MAE in *original* grams (invert log-space predictions)
-                if cfg.log_targets:
-                    rp_g = torch.expm1(rp.detach())
-                    dp_g = torch.expm1(dp.detach())
-                    fp_g = torch.expm1(fp.detach())
+                # Track MAE in *original* grams (de-standardize predictions)
+                if cfg.standardize_targets:
+                    rp_g = model.destandardize(rp.detach())
+                    dp_g = model.destandardize(dp.detach())
+                    fp_g = model.destandardize(fp.detach())
                     y_g = y_raw
                 else:
                     rp_g, dp_g, fp_g, y_g = rp.detach(), dp.detach(), fp.detach(), y
@@ -500,10 +500,10 @@ def _run_phase(  # noqa: C901
                         rp, dp, fp = model(rgb_b, rgbd_b)
                     bs = y_raw_b.size(0)
                     # Val MAE always in original grams
-                    if cfg.log_targets:
-                        rp_g = torch.expm1(rp)
-                        dp_g = torch.expm1(dp)
-                        fp_g = torch.expm1(fp)
+                    if cfg.standardize_targets:
+                        rp_g = model.destandardize(rp)
+                        dp_g = model.destandardize(dp)
+                        fp_g = model.destandardize(fp)
                         y_g = y_raw_b
                     else:
                         rp_g, dp_g, fp_g, y_g = rp, dp, fp, y_raw_b
@@ -698,7 +698,7 @@ def main() -> None:
     print(f"[train] device={device}  AMP={cfg.use_amp and device.type == 'cuda'}  "
           f"compile={cfg.use_compile}  grad_accum={cfg.grad_accum_steps}  "
           f"gpu_preload={cfg.preload_to_gpu and device.type == 'cuda'}  "
-          f"log_targets={cfg.log_targets}")
+          f"standardize_targets={cfg.standardize_targets}")
     print(f"[train] 3-phase training: {cfg.phase1_epochs} (RGB) + {cfg.phase2_epochs} (RGBD) "
           f"+ {cfg.phase3_epochs} (joint) = {total_epochs} total epochs")
 
@@ -745,8 +745,18 @@ def main() -> None:
             rgb_widths=cfg.rgb_widths,
             rgbd_widths=cfg.rgbd_widths,
             embed_dim=cfg.embed_dim,
-            log_targets=cfg.log_targets,
         ).to(device)
+
+        # Compute target statistics from the TRAINING split only for standardization
+        if cfg.standardize_targets:
+            train_targets = ds.targets[train_idx]
+            t_mean = float(train_targets.mean())
+            t_std = float(train_targets.std())
+            if t_std < 1e-6:
+                t_std = 1.0  # degenerate case
+            model.set_target_stats(t_mean, t_std)
+            print(f"[train] target standardization: mean={t_mean:.3f}  std={t_std:.3f}  "
+                  f"huber_delta={cfg.huber_delta:.2f} raw -> {cfg.huber_delta / t_std:.4f} standardized")
 
         if cfg.use_compile:
             try:

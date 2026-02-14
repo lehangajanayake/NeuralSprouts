@@ -247,11 +247,12 @@ class LettuceSAMFusionNet(nn.Module):
         branch_dropout: float = 0.15,
         fusion_hidden: int | None = None,
         fusion_dropout: float = 0.25,
-        log_targets: bool = False,
     ) -> None:
         super().__init__()
-        # Register as buffer so it's saved in state_dict and auto-restored
-        self.register_buffer("_log_targets", torch.tensor(bool(log_targets)))
+        # Target standardization buffers — saved in state_dict automatically.
+        # Defaults (0, 1) = no-op.  Call ``set_target_stats`` before training.
+        self.register_buffer("_target_mean", torch.tensor(0.0))
+        self.register_buffer("_target_std", torch.tensor(1.0))
         self.rgb_branch = RegressionBranch(
             in_channels=3,
             widths=rgb_widths,
@@ -274,10 +275,29 @@ class LettuceSAMFusionNet(nn.Module):
         )
         self.fusion_in_dropout = nn.Dropout(p=0.15)
 
+    # ---- target standardization helpers --------------------------------
+
+    def set_target_stats(self, mean: float, std: float) -> None:
+        """Set the mean / std used to standardize targets.
+
+        Must be called *before* training.  The values are saved inside the
+        checkpoint so eval / predict automatically de-standardize.
+        """
+        self._target_mean.fill_(mean)
+        self._target_std.fill_(max(std, 1e-6))
+
     @property
-    def log_targets(self) -> bool:
-        """Whether the model was trained with log1p-transformed targets."""
-        return bool(self._log_targets.item())
+    def uses_standardization(self) -> bool:
+        """True if non-trivial target stats have been set."""
+        return float(self._target_std.item()) != 1.0 or float(self._target_mean.item()) != 0.0
+
+    def standardize(self, y: torch.Tensor) -> torch.Tensor:
+        """Convert raw grams → z-score space."""
+        return (y - self._target_mean) / self._target_std
+
+    def destandardize(self, y: torch.Tensor) -> torch.Tensor:
+        """Convert z-score space → raw grams."""
+        return y * self._target_std + self._target_mean
 
     # ---- forward / inference -------------------------------------------
 
@@ -293,14 +313,12 @@ class LettuceSAMFusionNet(nn.Module):
     def predict_dry_weight(self, rgb: torch.Tensor, rgbd: torch.Tensor) -> torch.Tensor:
         """Run inference and return predictions in original grams.
 
-        If the model was trained with ``log_targets=True``, this applies
-        ``expm1`` to convert from log-space back to grams.
+        If target standardization was used during training, predictions are
+        automatically de-standardized.
         """
         self.eval()
         _, _, pred = self.forward(rgb, rgbd)
-        if self.log_targets:
-            pred = torch.expm1(pred)
-        return pred
+        return self.destandardize(pred)
 
     # ---- checkpoint helpers --------------------------------------------
 
@@ -331,14 +349,11 @@ class LettuceSAMFusionNet(nn.Module):
         *,
         device: torch.device | str = "cpu",
         drop_path_prob: float = 0.1,
-        log_targets: bool = True,
     ) -> "LettuceSAMFusionNet":
         """Instantiate a model and load weights from *path*.
 
-        Branch widths and embed dim are inferred automatically so the caller
-        never needs to hard-code architecture hyper-parameters.
-        If the checkpoint contains a ``_log_targets`` buffer, that value is
-        used; otherwise *log_targets* kwarg is applied.
+        Branch widths, embed dim, and target-standardization stats are all
+        inferred automatically from the saved ``state_dict``.
         """
         state = torch.load(path, map_location=device, weights_only=True)
         rgb_widths = cls.infer_branch_widths(state, "rgb_branch")
@@ -346,17 +361,16 @@ class LettuceSAMFusionNet(nn.Module):
         # Infer embed_dim from the regressor weight shape
         embed_key = "rgb_branch.regressor.weight"
         embed_dim = int(state[embed_key].shape[1]) if embed_key in state else 256
-        # Auto-detect log_targets from checkpoint (falls back to kwarg)
-        if "_log_targets" in state:
-            log_targets = bool(state["_log_targets"].item())
+        # Remove legacy keys that no longer exist in the model
+        for legacy_key in ("_log_targets",):
+            state.pop(legacy_key, None)
         model = cls(
             drop_path_prob=drop_path_prob,
             rgb_widths=rgb_widths,
             rgbd_widths=rgbd_widths,
             embed_dim=embed_dim,
-            log_targets=log_targets,
         )
-        model.load_state_dict(state)
+        model.load_state_dict(state, strict=False)
         return model.to(device)
 
 
