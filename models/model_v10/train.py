@@ -23,7 +23,7 @@ import os
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -64,13 +64,10 @@ class TrainConfig:
 
     # ---- training ---------------------------------------------------------
     batch_size: int = 128
-    num_epochs: int = 200
-    lr: float = 1e-3
     weight_decay: float = 1e-3
 
-    # OneCycleLR schedule — smooth warm-up → cosine decay per batch
-    onecycle_max_lr: float = 1e-3
-    onecycle_pct_start: float = 0.3        # fraction of training spent warming up
+    # OneCycleLR schedule (used inside each phase)
+    onecycle_pct_start: float = 0.3        # fraction of phase spent warming up
     onecycle_div_factor: float = 25.0      # initial_lr = max_lr / div_factor
     onecycle_final_div_factor: float = 1e4 # final_lr  = initial_lr / final_div_factor
 
@@ -95,14 +92,17 @@ class TrainConfig:
     huber_delta: float = 0.3
     ema_decay: float = 0.995
 
-    # ---- progressive unfreezing -------------------------------------------
-    initial_frozen_rgb_blocks: int = 3
-    initial_frozen_rgbd_blocks: int = 3
-    unfreeze_start_epoch: int = 7
-    rgb_unfreeze_interval: int = 5
-    rgbd_unfreeze_interval: int = 7
-    branch_warmup_epochs: int = 2
-    branch_warmup_scale: float = 0.3
+    # ---- phased branch-wise pretraining -----------------------------------
+    # Phase 1: train RGB branch alone (RGBD + fusion frozen)
+    # Phase 2: train RGBD branch alone (RGB + fusion frozen)
+    # Phase 3: fine-tune everything together (branches + fusion)
+    phase1_epochs: int = 60      # RGB branch pretraining
+    phase2_epochs: int = 60      # RGBD branch pretraining
+    phase3_epochs: int = 80      # joint fine-tuning
+    phase1_lr: float = 2e-3      # higher LR for branch pretraining
+    phase2_lr: float = 2e-3
+    phase3_lr: float = 5e-4      # lower LR for fine-tuning
+    phase3_branch_lr_scale: float = 0.2  # branches get lr * this in phase 3
 
     # ---- speed / hardware -------------------------------------------------
     use_amp: bool = True
@@ -153,79 +153,23 @@ def _update_ema(ema: nn.Module, model: nn.Module, decay: float) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Block freezing / unfreezing / warmup (identical logic to v8)
+# Freeze / unfreeze helpers for phased training
 # ---------------------------------------------------------------------------
 
-def _apply_freezing(blocks: Sequence[nn.Module], frozen: int) -> None:
-    frozen = max(0, min(int(frozen), len(blocks)))
-    for i, b in enumerate(blocks):
-        req = i >= frozen
-        for p in b.parameters():
-            p.requires_grad = req
+def _freeze_module(module: nn.Module) -> None:
+    """Freeze all parameters in *module*."""
+    for p in module.parameters():
+        p.requires_grad = False
 
 
-def _maybe_unfreeze(
-    epoch: int,
-    start: int,
-    interval: int,
-    frozen: int,
-    blocks: Sequence[nn.Module],
-    name: str,
-    on_unfreeze: Optional[Callable[[int], None]] = None,
-) -> int:
-    if frozen <= 0:
-        return frozen
-    if (epoch + 1) < max(1, start):
-        return frozen
-    elapsed = (epoch + 1) - max(1, start)
-    trigger = elapsed >= 0 and (elapsed % max(1, interval) == 0)
-    if not trigger:
-        return frozen
-    new = max(0, frozen - 1)
-    if new == frozen:
-        return frozen
-    _apply_freezing(blocks, new)
-    print(f"  ↳ unfreezing {name} block {new}")
-    if on_unfreeze:
-        on_unfreeze(new)
-    return new
+def _unfreeze_module(module: nn.Module) -> None:
+    """Unfreeze all parameters in *module*."""
+    for p in module.parameters():
+        p.requires_grad = True
 
 
-_WarmupTracker = Dict[Tuple[str, int], Dict[str, int]]
-
-
-def _start_warmup(tracker: _WarmupTracker, branch: str, idx: int, epochs: int) -> None:
-    if epochs > 0:
-        tracker[(branch, idx)] = {"remaining": epochs, "total": epochs}
-
-
-def _scale_warmup_grads(
-    tracker: _WarmupTracker,
-    blocks_map: Dict[str, Sequence[nn.Module]],
-    min_scale: float,
-) -> None:
-    for (branch, idx), state in tracker.items():
-        rem = state.get("remaining", 0)
-        if rem <= 0:
-            continue
-        seq = blocks_map.get(branch)
-        if seq is None or idx < 0 or idx >= len(seq):
-            continue
-        progress = 1.0 - rem / max(1, state.get("total", 1))
-        scale = min_scale + (1.0 - min_scale) * progress
-        for p in seq[idx].parameters():
-            if p.grad is not None:
-                p.grad.mul_(scale)
-
-
-def _tick_warmups(tracker: _WarmupTracker) -> None:
-    to_del = []
-    for key, state in tracker.items():
-        state["remaining"] -= 1
-        if state["remaining"] <= 0:
-            to_del.append(key)
-    for k in to_del:
-        tracker.pop(k, None)
+def _count_trainable(model: nn.Module) -> int:
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
 
 # ---------------------------------------------------------------------------
@@ -347,18 +291,26 @@ def _save(path: str, model: nn.Module) -> None:
 
 
 def _save_curves(
-    train_h: List[float], val_h: List[float], out_dir: str, suffix: str = "", best_ep: Optional[int] = None
+    train_h: List[float], val_h: List[float], out_dir: str, suffix: str = "",
+    best_ep: Optional[int] = None,
+    phase_boundaries: Optional[List[int]] = None,
 ) -> None:
     if plt is None or not train_h:
         return
-    fig, ax = plt.subplots(figsize=(6, 4))
+    fig, ax = plt.subplots(figsize=(8, 4.5))
     ax.plot(range(1, len(train_h) + 1), train_h, label="Train MAE")
     ax.plot(range(1, len(val_h) + 1), val_h, label="Val MAE")
     if best_ep and 1 <= best_ep <= len(val_h):
         ax.scatter([best_ep], [val_h[best_ep - 1]], c="red", s=40, zorder=5, label=f"Best ep {best_ep}")
-    ax.set(xlabel="Epoch", ylabel="MAE", title="Training vs Validation MAE")
+    # Draw vertical lines at phase boundaries
+    if phase_boundaries:
+        phase_labels = ["RGB→RGBD", "RGBD→Joint"]
+        for i, bnd in enumerate(phase_boundaries):
+            lbl = phase_labels[i] if i < len(phase_labels) else f"Phase {i+2}"
+            ax.axvline(bnd + 0.5, color="gray", linestyle=":", linewidth=1.5, alpha=0.7, label=lbl)
+    ax.set(xlabel="Epoch", ylabel="MAE", title="Training vs Validation MAE (3-phase)")
     ax.grid(True, ls="--", lw=0.5, alpha=0.6)
-    ax.legend()
+    ax.legend(fontsize=8)
     name = f"training_curves{suffix}.png" if suffix else "training_curves.png"
     fig.savefig(Path(out_dir) / name, dpi=150, bbox_inches="tight")
     plt.close(fig)
@@ -368,98 +320,124 @@ def _save_curves(
 # Core training loop
 # ---------------------------------------------------------------------------
 
-def _train_one_fold(  # noqa: C901
+def _make_optimizer(
+    params,
+    lr: float,
+    weight_decay: float,
+    device: torch.device,
+) -> optim.Optimizer:
+    """Create AdamW with fused kernel when on CUDA."""
+    fused = device.type == "cuda"
+    try:
+        return optim.AdamW(params, lr=lr, weight_decay=weight_decay, fused=fused)
+    except TypeError:
+        return optim.AdamW(params, lr=lr, weight_decay=weight_decay)
+
+
+def _run_phase(  # noqa: C901
+    *,
+    phase_name: str,
     cfg: TrainConfig,
     model: LettuceSAMFusionNet,
+    ema_model: Optional[nn.Module],
     train_loader: DataLoader,
     val_loader: DataLoader,
     device: torch.device,
-    fold_suffix: str = "",
-    fold_label: str = "",
-) -> Tuple[str, List[float], List[float], float, Optional[int]]:
-    # Loss
+    max_lr: float,
+    num_epochs: int,
+    loss_weights: Tuple[float, float, float],
+    train_hist: List[float],
+    val_hist: List[float],
+    best_smooth: float,
+    best_epoch: Optional[int],
+    best_path: str,
+    curves_suffix: str,
+    fold_label: str,
+    use_early_stop: bool = False,
+    eval_metric: str = "fused",
+    branch_lr_scale: float = 1.0,
+    phase_boundaries: Optional[List[int]] = None,
+) -> Tuple[float, Optional[int]]:
+    """Run one training phase (branch pretrain or joint fine-tune).
+
+    Parameters
+    ----------
+    loss_weights : (rgb_w, rgbd_w, fusion_w)
+        Weights for each branch's loss.  Set a weight to 0 to ignore that head.
+    eval_metric : 'fused' | 'rgb' | 'rgbd'
+        Which prediction to use for val MAE tracking.
+    branch_lr_scale : float
+        Multiply the LR for branch parameters by this factor.  Use < 1.0
+        in Phase 3 so pretrained branches don't drift while fusion trains.
+    phase_boundaries : list of epoch indices where phases change (for plotting).
+    """
     criterion = (
         nn.SmoothL1Loss(beta=cfg.huber_delta) if cfg.huber_delta > 0 else nn.L1Loss()
     )
+    rgb_w, rgbd_w, fusion_w = loss_weights
 
-    # Optimizer — fused kernel on CUDA
+    # Build parameter groups with differential LR for branches vs fusion
+    branch_params = [p for n, p in model.named_parameters()
+                     if p.requires_grad and ("rgb_branch" in n or "rgbd_branch" in n)]
+    fusion_params = [p for n, p in model.named_parameters()
+                     if p.requires_grad and "rgb_branch" not in n and "rgbd_branch" not in n]
+    branch_lr = max_lr * branch_lr_scale
+    param_groups = []
+    if branch_params:
+        param_groups.append({"params": branch_params, "lr": branch_lr})
+    if fusion_params:
+        param_groups.append({"params": fusion_params, "lr": max_lr})
+    if not param_groups:
+        print(f"  WARNING: no trainable parameters in {phase_name}!")
+        return best_smooth, best_epoch
+
+    n_trainable = sum(p.numel() for pg in param_groups for p in pg["params"])
+    print(f"\n{'='*60}")
+    print(f"  Phase: {phase_name}")
+    print(f"  Epochs: {num_epochs}  |  trainable params: {n_trainable:,}")
+    if branch_lr_scale < 1.0:
+        print(f"  LR: branches={branch_lr:.1e}  fusion/head={max_lr:.1e}  (scale={branch_lr_scale})")
+    else:
+        print(f"  LR: {max_lr:.1e}")
+    print(f"  Loss weights: RGB={rgb_w:.1f}  RGBD={rgbd_w:.1f}  Fusion={fusion_w:.1f}")
+    print(f"  Eval metric: {eval_metric}")
+    print(f"{'='*60}")
+
     fused = device.type == "cuda"
     try:
-        optimizer = optim.AdamW(
-            model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay, fused=fused
-        )
+        optimizer = optim.AdamW(param_groups, weight_decay=cfg.weight_decay, fused=fused)
     except TypeError:
-        # PyTorch < 2.0 doesn't support fused
-        optimizer = optim.AdamW(
-            model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay
-        )
+        optimizer = optim.AdamW(param_groups, weight_decay=cfg.weight_decay)
 
+    max_lrs = [pg["lr"] for pg in param_groups]
     steps_per_epoch = len(train_loader)
-    total_steps = steps_per_epoch * cfg.num_epochs
+    total_steps = steps_per_epoch * num_epochs
     scheduler = optim.lr_scheduler.OneCycleLR(
         optimizer,
-        max_lr=cfg.onecycle_max_lr,
+        max_lr=max_lrs,
         total_steps=total_steps,
         pct_start=cfg.onecycle_pct_start,
         div_factor=cfg.onecycle_div_factor,
         final_div_factor=cfg.onecycle_final_div_factor,
         anneal_strategy="cos",
     )
-    stopper = _EarlyStopper(cfg.patience)
 
-    # AMP scaler
+    stopper = _EarlyStopper(cfg.patience) if use_early_stop else None
+
     amp_enabled = cfg.use_amp and device.type == "cuda"
     scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled)
     amp_dtype = torch.float16
-
-    # EMA
-    use_ema = cfg.ema_decay > 0
-    ema_model = copy.deepcopy(model).to(device) if use_ema else None
-    if ema_model is not None:
-        for p in ema_model.parameters():
-            p.requires_grad_(False)
-
-    # Block freezing
-    rgb_blocks = list(model.rgb_branch.features)
-    rgbd_blocks = list(model.rgbd_branch.features)
-    blocks_map: Dict[str, Sequence[nn.Module]] = {"RGB": rgb_blocks, "RGBD": rgbd_blocks}
-    warmups: _WarmupTracker = {}
-    frozen_rgb = min(cfg.initial_frozen_rgb_blocks, len(rgb_blocks))
-    frozen_rgbd = min(cfg.initial_frozen_rgbd_blocks, len(rgbd_blocks))
-    if frozen_rgb > 0:
-        _apply_freezing(rgb_blocks, frozen_rgb)
-    if frozen_rgbd > 0:
-        _apply_freezing(rgbd_blocks, frozen_rgbd)
-
-    best_name = f"best_model_v10{fold_suffix}.pth"
-    best_path = str(Path(cfg.out_dir) / best_name)
-    train_hist: List[float] = []
-    val_hist: List[float] = []
-    best_epoch: Optional[int] = None
-    best_smooth: float = float("inf")  # dedicated tracker — independent of early stopper
+    use_ema = ema_model is not None
     accum = max(1, cfg.grad_accum_steps)
-    curves_suffix = fold_suffix
-
-    def _on_rgb_unfreeze(idx: int) -> None:
-        _start_warmup(warmups, "RGB", idx, cfg.branch_warmup_epochs)
-
-    def _on_rgbd_unfreeze(idx: int) -> None:
-        _start_warmup(warmups, "RGBD", idx, cfg.branch_warmup_epochs)
+    global_epoch_offset = len(train_hist)  # for display numbering
 
     try:
-        for epoch in range(cfg.num_epochs):
-            frozen_rgb = _maybe_unfreeze(
-                epoch, cfg.unfreeze_start_epoch, cfg.rgb_unfreeze_interval,
-                frozen_rgb, rgb_blocks, "RGB", _on_rgb_unfreeze,
-            )
-            frozen_rgbd = _maybe_unfreeze(
-                epoch, cfg.unfreeze_start_epoch, cfg.rgbd_unfreeze_interval,
-                frozen_rgbd, rgbd_blocks, "RGBD", _on_rgbd_unfreeze,
-            )
+        for ep in range(num_epochs):
+            global_ep = global_epoch_offset + ep + 1
 
             # ---- train ------------------------------------------------
             model.train()
-            t_mae_sum, t_loss_sum, n_t = 0.0, 0.0, 0
+            t_mae_sum, n_t = 0.0, 0
             optimizer.zero_grad(set_to_none=True)
 
             for step, batch in enumerate(train_loader):
@@ -470,46 +448,52 @@ def _train_one_fold(  # noqa: C901
 
                 with torch.amp.autocast("cuda", enabled=amp_enabled, dtype=amp_dtype):
                     rp, dp, fp = model(rgb, rgbd)
-                    loss = (
-                        RGB_LOSS_WEIGHT * criterion(rp, y)
-                        + RGBD_LOSS_WEIGHT * criterion(dp, y)
-                        + FUSION_LOSS_WEIGHT * criterion(fp, y)
-                    ) / accum
+                    loss = 0.0
+                    if rgb_w > 0:
+                        loss = loss + rgb_w * criterion(rp, y)
+                    if rgbd_w > 0:
+                        loss = loss + rgbd_w * criterion(dp, y)
+                    if fusion_w > 0:
+                        loss = loss + fusion_w * criterion(fp, y)
+                    loss = loss / accum
 
                 scaler.scale(loss).backward()
-                _scale_warmup_grads(warmups, blocks_map, cfg.branch_warmup_scale)
 
                 if (step + 1) % accum == 0 or (step + 1) == len(train_loader):
                     scaler.step(optimizer)
                     scaler.update()
-                    scheduler.step()  # OneCycleLR steps per batch
+                    scheduler.step()
                     optimizer.zero_grad(set_to_none=True)
                     if use_ema and ema_model is not None:
                         _update_ema(ema_model, model, cfg.ema_decay)
 
                 bs = y.size(0)
-                t_loss_sum += loss.item() * accum * bs
-                t_mae_sum += torch.mean(torch.abs(fp.detach() - y)).item() * bs
+                # Track MAE from the relevant prediction
+                if eval_metric == "rgb":
+                    t_mae_sum += torch.mean(torch.abs(rp.detach() - y)).item() * bs
+                elif eval_metric == "rgbd":
+                    t_mae_sum += torch.mean(torch.abs(dp.detach() - y)).item() * bs
+                else:
+                    t_mae_sum += torch.mean(torch.abs(fp.detach() - y)).item() * bs
                 n_t += bs
 
             # ---- validate ----------------------------------------------
             model.eval()
-            v_mae_sum, v_loss_sum, n_v = 0.0, 0.0, 0
+            v_mae_sum, n_v = 0.0, 0
             with torch.no_grad():
                 for batch in val_loader:
-                    rgb = batch["rgb"].to(device, non_blocking=True)
-                    rgbd = batch["rgbd"].to(device, non_blocking=True)
-                    y = batch["dry_weight"].to(device, non_blocking=True)
+                    rgb_b = batch["rgb"].to(device, non_blocking=True)
+                    rgbd_b = batch["rgbd"].to(device, non_blocking=True)
+                    y_b = batch["dry_weight"].to(device, non_blocking=True)
                     with torch.amp.autocast("cuda", enabled=amp_enabled, dtype=amp_dtype):
-                        rp, dp, fp = model(rgb, rgbd)
-                        vloss = (
-                            RGB_LOSS_WEIGHT * criterion(rp, y)
-                            + RGBD_LOSS_WEIGHT * criterion(dp, y)
-                            + FUSION_LOSS_WEIGHT * criterion(fp, y)
-                        )
-                    bs = y.size(0)
-                    v_loss_sum += vloss.item() * bs
-                    v_mae_sum += torch.mean(torch.abs(fp - y)).item() * bs
+                        rp, dp, fp = model(rgb_b, rgbd_b)
+                    bs = y_b.size(0)
+                    if eval_metric == "rgb":
+                        v_mae_sum += torch.mean(torch.abs(rp - y_b)).item() * bs
+                    elif eval_metric == "rgbd":
+                        v_mae_sum += torch.mean(torch.abs(dp - y_b)).item() * bs
+                    else:
+                        v_mae_sum += torch.mean(torch.abs(fp - y_b)).item() * bs
                     n_v += bs
 
             t_mae = t_mae_sum / max(1, n_t)
@@ -521,43 +505,150 @@ def _train_one_fold(  # noqa: C901
             lr_now = optimizer.param_groups[0]["lr"]
             tag = f"[{fold_label}] " if fold_label else ""
             print(
-                f"  {tag}epoch {epoch+1:>3}/{cfg.num_epochs}  lr={lr_now:.2e}  "
-                f"train_mae={t_mae:.4f}  val_mae={v_mae:.4f}  "
+                f"  {tag}{phase_name} ep {ep+1:>3}/{num_epochs} (global {global_ep})  "
+                f"lr={lr_now:.2e}  train={t_mae:.4f}  val={v_mae:.4f}  "
                 f"smooth({span})={smooth:.4f}"
             )
 
-            # Save checkpoint only on strict improvement
+            # Checkpoint on improvement (only save during phase 3 / joint,
+            # or if we're in a branch phase and it improves)
             if smooth < best_smooth:
                 best_smooth = smooth
                 target = ema_model if use_ema and ema_model is not None else model
                 _save(best_path, target)
-                best_epoch = epoch + 1
+                best_epoch = global_ep
                 print(f"    ★ saved best model (smooth={smooth:.4f})")
 
-            if stopper.step(smooth):
-                print(f"  early stop at epoch {epoch+1} (best_smooth={best_smooth:.4f})")
+            if stopper is not None and stopper.step(smooth):
+                print(f"  early stop at epoch {ep+1} (best_smooth={best_smooth:.4f})")
                 break
 
-            # Save curves periodically so progress is visible during training
-            if (epoch + 1) % 5 == 0 or (epoch + 1) == cfg.num_epochs:
+            if (ep + 1) % 5 == 0 or (ep + 1) == num_epochs:
                 _save_curves(train_hist, val_hist, cfg.out_dir,
-                             suffix=curves_suffix, best_ep=best_epoch)
-
-            _tick_warmups(warmups)
+                             suffix=curves_suffix, best_ep=best_epoch,
+                             phase_boundaries=phase_boundaries)
 
     except KeyboardInterrupt:
-        print("\n  interrupted — saving checkpoint…")
+        print(f"\n  interrupted during {phase_name} — saving checkpoint…")
         target = ema_model if use_ema and ema_model is not None else model
         _save(best_path, target)
+
+    _save_curves(train_hist, val_hist, cfg.out_dir,
+                 suffix=curves_suffix, best_ep=best_epoch,
+                 phase_boundaries=phase_boundaries)
+
+    return best_smooth, best_epoch
+
+
+def _train_one_fold(  # noqa: C901
+    cfg: TrainConfig,
+    model: LettuceSAMFusionNet,
+    train_loader: DataLoader,
+    val_loader: DataLoader,
+    device: torch.device,
+    fold_suffix: str = "",
+    fold_label: str = "",
+) -> Tuple[str, List[float], List[float], float, Optional[int]]:
+    best_name = f"best_model_v10{fold_suffix}.pth"
+    best_path = str(Path(cfg.out_dir) / best_name)
+    train_hist: List[float] = []
+    val_hist: List[float] = []
+    best_epoch: Optional[int] = None
+    best_smooth: float = float("inf")
+    curves_suffix = fold_suffix
+    phase_boundaries: List[int] = []  # global epoch indices where phases change
+
+    # EMA
+    use_ema = cfg.ema_decay > 0
+    ema_model = copy.deepcopy(model).to(device) if use_ema else None
+    if ema_model is not None:
+        for p in ema_model.parameters():
+            p.requires_grad_(False)
+
+    # ==================================================================
+    # Phase 1 — RGB branch pretraining
+    # ==================================================================
+    _freeze_module(model.rgbd_branch)          # freeze RGBD
+    _freeze_module(model.fusion)               # freeze fusion
+    _freeze_module(model.fusion_in_dropout)    # freeze fusion dropout
+    _unfreeze_module(model.rgb_branch)         # only RGB trains
+
+    best_smooth, best_epoch = _run_phase(
+        phase_name="Phase 1: RGB branch",
+        cfg=cfg, model=model, ema_model=ema_model,
+        train_loader=train_loader, val_loader=val_loader, device=device,
+        max_lr=cfg.phase1_lr, num_epochs=cfg.phase1_epochs,
+        loss_weights=(1.0, 0.0, 0.0),  # only RGB loss
+        train_hist=train_hist, val_hist=val_hist,
+        best_smooth=best_smooth, best_epoch=best_epoch,
+        best_path=best_path, curves_suffix=curves_suffix,
+        fold_label=fold_label,
+        use_early_stop=False,
+        eval_metric="rgb",
+        phase_boundaries=phase_boundaries,
+    )
+    phase_boundaries.append(len(train_hist))  # mark Phase 1 → 2 boundary
+
+    # ==================================================================
+    # Phase 2 — RGBD branch pretraining
+    # ==================================================================
+    _freeze_module(model.rgb_branch)           # freeze RGB
+    _freeze_module(model.fusion)               # keep fusion frozen
+    _unfreeze_module(model.rgbd_branch)        # only RGBD trains
+
+    best_smooth, best_epoch = _run_phase(
+        phase_name="Phase 2: RGBD branch",
+        cfg=cfg, model=model, ema_model=ema_model,
+        train_loader=train_loader, val_loader=val_loader, device=device,
+        max_lr=cfg.phase2_lr, num_epochs=cfg.phase2_epochs,
+        loss_weights=(0.0, 1.0, 0.0),  # only RGBD loss
+        train_hist=train_hist, val_hist=val_hist,
+        best_smooth=best_smooth, best_epoch=best_epoch,
+        best_path=best_path, curves_suffix=curves_suffix,
+        fold_label=fold_label,
+        use_early_stop=False,
+        eval_metric="rgbd",
+        phase_boundaries=phase_boundaries,
+    )
+    phase_boundaries.append(len(train_hist))  # mark Phase 2 → 3 boundary
+
+    # ==================================================================
+    # Phase 3 — Joint fine-tuning (everything unfrozen)
+    # ==================================================================
+    # Reset val tracking for the joint phase — branch-level MAE is not
+    # comparable to fused MAE so we start best_smooth fresh.
+    best_smooth = float("inf")
+    best_epoch = None
+
+    _unfreeze_module(model.rgb_branch)
+    _unfreeze_module(model.rgbd_branch)
+    _unfreeze_module(model.fusion)
+    _unfreeze_module(model.fusion_in_dropout)
+
+    best_smooth, best_epoch = _run_phase(
+        phase_name="Phase 3: Joint fine-tune",
+        cfg=cfg, model=model, ema_model=ema_model,
+        train_loader=train_loader, val_loader=val_loader, device=device,
+        max_lr=cfg.phase3_lr, num_epochs=cfg.phase3_epochs,
+        loss_weights=(RGB_LOSS_WEIGHT, RGBD_LOSS_WEIGHT, FUSION_LOSS_WEIGHT),
+        train_hist=train_hist, val_hist=val_hist,
+        best_smooth=best_smooth, best_epoch=best_epoch,
+        best_path=best_path, curves_suffix=curves_suffix,
+        fold_label=fold_label,
+        use_early_stop=True,
+        eval_metric="fused",
+        branch_lr_scale=cfg.phase3_branch_lr_scale,
+        phase_boundaries=phase_boundaries,
+    )
 
     # Ensure at least one checkpoint exists
     if not os.path.exists(best_path):
         target = ema_model if use_ema and ema_model is not None else model
         _save(best_path, target)
 
-    # Always save final curves (covers normal end, early stop, and Ctrl+C)
     _save_curves(train_hist, val_hist, cfg.out_dir,
-                 suffix=curves_suffix, best_ep=best_epoch)
+                 suffix=curves_suffix, best_ep=best_epoch,
+                 phase_boundaries=phase_boundaries)
 
     return best_path, train_hist, val_hist, best_smooth, best_epoch
 
@@ -571,9 +662,12 @@ def main() -> None:
     Path(cfg.out_dir).mkdir(parents=True, exist_ok=True)
     seed_everything(cfg.seed, deterministic=True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    total_epochs = cfg.phase1_epochs + cfg.phase2_epochs + cfg.phase3_epochs
     print(f"[train] device={device}  AMP={cfg.use_amp and device.type == 'cuda'}  "
           f"compile={cfg.use_compile}  grad_accum={cfg.grad_accum_steps}  "
           f"gpu_preload={cfg.preload_to_gpu and device.type == 'cuda'}")
+    print(f"[train] 3-phase training: {cfg.phase1_epochs} (RGB) + {cfg.phase2_epochs} (RGBD) "
+          f"+ {cfg.phase3_epochs} (joint) = {total_epochs} total epochs")
 
     # ---- Load shard dataset ------------------------------------------------
     ds = ShardDataset(
