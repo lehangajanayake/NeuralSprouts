@@ -69,14 +69,14 @@ class TrainConfig:
     weight_decay: float = 1e-3
 
     # OneCycleLR schedule — smooth warm-up → cosine decay per batch
-    onecycle_max_lr: float = 3e-3
+    onecycle_max_lr: float = 1e-3
     onecycle_pct_start: float = 0.3        # fraction of training spent warming up
     onecycle_div_factor: float = 25.0      # initial_lr = max_lr / div_factor
     onecycle_final_div_factor: float = 1e4 # final_lr  = initial_lr / final_div_factor
 
     # ---- split / fold -----------------------------------------------------
     labels_csv: str = "../../datasets/Training/Train.csv"  # for variety + weight info
-    val_per_cell: int = 3  # original images per (variety × weight-regime) cell in val
+    val_per_cell: int = 2  # original images per (variety × weight-regime) cell in val
     val_ratio: float = 0.2
     seed: int = 43
     patience: int = 150
@@ -90,7 +90,7 @@ class TrainConfig:
     embed_dim: int = 96
 
     # ---- regularisation ---------------------------------------------------
-    mixup_alpha: float = 0.4
+    mixup_alpha: float = 0.2
     mixup_prob: float = 0.5
     huber_delta: float = 0.3
     ema_decay: float = 0.995

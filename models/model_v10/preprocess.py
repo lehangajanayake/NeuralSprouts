@@ -73,7 +73,7 @@ class PreprocessConfig:
     color_jitter_prob: float = 0.9
     gaussian_blur_prob: float = 0.3
     random_affine_prob: float = 0.4
-    random_erasing_prob: float = 0.3
+    random_erasing_prob: float = 0.15
 
     # ---- sharding ---------------------------------------------------------
     shard_size: int = 256  # samples per .pt file
