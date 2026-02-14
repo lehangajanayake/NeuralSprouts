@@ -163,16 +163,12 @@ def _apply_augmentations(
     if k:
         rgb, depth = TF.rotate(rgb, 90 * k), TF.rotate(depth, 90 * k)
 
-    # Random affine (small shear + translate) for pose diversity
+    # Random affine (small shear + rotation, NO translate to avoid clipping)
     if rng.rand() < cfg.random_affine_prob:
         angle = float(rng.uniform(-15, 15))
         shear = float(rng.uniform(-10, 10))
-        tx = float(rng.uniform(-0.05, 0.05))
-        ty = float(rng.uniform(-0.05, 0.05))
-        w, h = rgb.size
-        translate = (int(tx * w), int(ty * h))
-        rgb = TF.affine(rgb, angle=angle, translate=translate, scale=1.0, shear=shear)
-        depth = TF.affine(depth, angle=angle, translate=translate, scale=1.0, shear=shear)
+        rgb = TF.affine(rgb, angle=angle, translate=(0, 0), scale=1.0, shear=shear)
+        depth = TF.affine(depth, angle=angle, translate=(0, 0), scale=1.0, shear=shear)
 
     # --- photometric (rgb only) ---
     if rng.rand() < max(0.0, min(1.0, cfg.color_jitter_prob)):
