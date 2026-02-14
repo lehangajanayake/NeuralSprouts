@@ -31,10 +31,10 @@ class TrainConfig:
     rgb_dir: str = '../../datasets/Training/Augmented_v8/RGBImages'
     depth_dir: str = '../../datasets/Training/Augmented_v8/DepthImages'
 
-    batch_size: int = 128
+    batch_size: int = 256
     num_epochs: int = 100
     lr: float = 1e-3
-    weight_decay: float = 1e-5
+    weight_decay: float = 1e-4
     scheduler_factor: float = 0.5
     scheduler_patience: int = 10
     scheduler_min_lr: float = 1e-6
@@ -54,32 +54,32 @@ class TrainConfig:
     blacklist_ids: Tuple[int, ...] = (163,)
     best_mae_window: int = 5
     ema_decay: float = 0.995
-    drop_path_prob: float = 0
+    drop_path_prob: float = 0.1
     rgb_widths: Tuple[int, ...] = (32, 64, 96, 128)
     rgbd_widths: Tuple[int, ...] = (32, 64, 96, 128)
     embed_dim: int = 256
     spatial_kernel: Tuple[int, ...] = (5, 7)
-    spatial_layers: int = 2
-    spatial_dropout: float = 0.3
+    spatial_layers: int = 1
+    spatial_dropout: float = 0.1
     share_spatial_attn: bool = False
 
     mixup_alpha: float = 0.2
-    mixup_prob: float = 0.5
+    mixup_prob: float = 0.3
 
 
     cutmix_alpha: float = 0.4
     cutmix_prob: float = 0.0
 
 
-    initial_frozen_rgb_blocks: int = 3
-    initial_frozen_rgbd_blocks: int = 3
+    initial_frozen_rgb_blocks: int = 2
+    initial_frozen_rgbd_blocks: int = 2
     unfreeze_interval: int = 5
     rgb_unfreeze_interval: int = 5
     rgbd_unfreeze_interval: int = 7
-    unfreeze_start_epoch: int =7
+    unfreeze_start_epoch: int = 7
     branch_warmup_epochs: int = 2
     branch_warmup_scale: float = 0.3
-    huber_delta: float = 0.3
+    huber_delta: float = 1.0
 
 
 def seed_everything(seed: int = 42, deterministic: bool = True):
@@ -530,22 +530,20 @@ def save_training_curves(train_history: List[float], val_history: List[float], o
         return
 
     epochs = range(1, len(train_history) + 1)
-    fig, ax = plt.subplots(figsize=(6, 4))
+    fig, ax = plt.subplots(figsize=(8, 4.5))
     ax.plot(epochs, train_history, label='Train MAE')
     ax.plot(epochs, val_history, label='Val MAE')
+    if best_epoch is not None and 1 <= best_epoch <= len(train_history):
+        best_val = val_history[best_epoch - 1]
+        ax.scatter([best_epoch], [best_val], color='red', s=40, zorder=5, label=f'Best ep {best_epoch}')
     ax.set_xlabel('Epoch')
     ax.set_ylabel('MAE')
     ax.set_title('Training vs Validation MAE')
-    ax.set_ylim(0.0, 1.0)
     ax.grid(True, linestyle='--', linewidth=0.5, alpha=0.6)
-    ax.legend()
+    ax.legend(fontsize=8)
 
     out_name = f'training_curves{suffix}.png' if suffix else 'training_curves.png'
     out_path = Path(out_dir) / out_name
-    if best_epoch is not None and 1 <= best_epoch <= len(train_history):
-        best_val = val_history[best_epoch - 1]
-        ax.scatter([best_epoch], [best_val], color='red', s=40, label=f'Best epoch {best_epoch}')
-        ax.legend()
     fig.savefig(out_path, dpi=150, bbox_inches='tight')
     plt.close(fig)
     print(f'Saved training curves to: {out_path}')
