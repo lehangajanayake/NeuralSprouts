@@ -4,7 +4,7 @@ import random
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Dict, List, Sequence, Tuple
+from typing import Dict, List, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -32,12 +32,8 @@ class TrainConfig:
     depth_dir: str = '../../datasets/Training/Augmented_v8/DepthImages'
 
     batch_size: int = 256
-    num_epochs: int = 100
     lr: float = 1e-3
     weight_decay: float = 1e-4
-    scheduler_factor: float = 0.5
-    scheduler_patience: int = 10
-    scheduler_min_lr: float = 1e-6
 
     val_ratio: float = 0.2
     seed: int = 43
@@ -66,20 +62,24 @@ class TrainConfig:
     mixup_alpha: float = 0.2
     mixup_prob: float = 0.3
 
-
     cutmix_alpha: float = 0.4
     cutmix_prob: float = 0.0
 
-
-    initial_frozen_rgb_blocks: int = 2
-    initial_frozen_rgbd_blocks: int = 2
-    unfreeze_interval: int = 5
-    rgb_unfreeze_interval: int = 5
-    rgbd_unfreeze_interval: int = 7
-    unfreeze_start_epoch: int = 7
-    branch_warmup_epochs: int = 2
-    branch_warmup_scale: float = 0.3
     huber_delta: float = 1.0
+
+    # ---- 3-phase staged training ------------------------------------------
+    phase1_epochs: int = 20       # RGB branch pretraining
+    phase2_epochs: int = 20       # RGBD branch pretraining
+    phase3_epochs: int = 80       # Joint fine-tuning
+    phase1_lr: float = 1e-3
+    phase2_lr: float = 1e-3
+    phase3_lr: float = 5e-4       # lower for fine-tuning
+    phase3_branch_lr_scale: float = 0.2  # branches get lr * this in phase 3
+
+    # OneCycleLR schedule
+    onecycle_pct_start: float = 0.3
+    onecycle_div_factor: float = 25.0
+    onecycle_final_div_factor: float = 1e4
 
 
 def seed_everything(seed: int = 42, deterministic: bool = True):
@@ -186,99 +186,14 @@ def apply_block_freezing(blocks: Sequence[nn.Module], frozen_count: int) -> None
             param.requires_grad = requires
 
 
-def maybe_unfreeze_blocks(
-    epoch: int,
-    start_epoch: int,
-    interval: int,
-    current_frozen: int,
-    blocks: Sequence[nn.Module],
-    branch_name: str,
-    on_unfreeze: Callable[[int], None] | None = None,
-) -> Tuple[int, int | None]:
-    if current_frozen <= 0:
-        return current_frozen, None
-    if (epoch + 1) < max(1, start_epoch):
-        return current_frozen, None
-    if interval <= 0:
-        interval_trigger = (epoch + 1) == max(1, start_epoch)
-    else:
-        elapsed = (epoch + 1) - max(1, start_epoch)
-        interval_trigger = elapsed >= 0 and (elapsed % interval == 0)
-    if not interval_trigger:
-        return current_frozen, None
-    new_frozen = max(0, current_frozen - 1)
-    if new_frozen == current_frozen:
-        return current_frozen, None
-    apply_block_freezing(blocks, new_frozen)
-    print(f"[train] unfreezing {branch_name} block index {new_frozen} (reason=schedule)")
-    if on_unfreeze is not None:
-        on_unfreeze(new_frozen)
-    return new_frozen, new_frozen
+def _freeze_module(module: nn.Module) -> None:
+    for p in module.parameters():
+        p.requires_grad = False
 
 
-def start_block_warmup(
-    tracker: Dict[Tuple[str, int], Dict[str, int]],
-    branch: str,
-    block_idx: int,
-    epochs: int,
-) -> None:
-    epochs = max(0, int(epochs))
-    if epochs <= 0:
-        return
-    tracker[(branch, block_idx)] = {
-        'remaining': epochs,
-        'total': epochs,
-    }
-
-
-def apply_block_warmup_scaling(
-    tracker: Dict[Tuple[str, int], Dict[str, int]],
-    blocks_map: Dict[str, Sequence[nn.Module]],
-    min_scale: float,
-) -> None:
-    if not tracker:
-        return
-    min_scale = float(min_scale)
-    if min_scale >= 1.0:
-        return
-    clamped = max(0.0, min(1.0, min_scale))
-    for (branch, idx), state in tracker.items():
-        remaining = int(state.get('remaining', 0))
-        total = max(1, int(state.get('total', 1)))
-        if remaining <= 0:
-            continue
-        seq = blocks_map.get(branch)
-        if seq is None or idx < 0 or idx >= len(seq):
-            continue
-        progress = 1.0 - (remaining / total)
-        scale = clamped + (1.0 - clamped) * progress
-        block = seq[idx]
-        for param in block.parameters():
-            if param.grad is not None:
-                param.grad.mul_(scale)
-
-
-def decay_block_warmups(tracker: Dict[Tuple[str, int], Dict[str, int]]) -> None:
-    if not tracker:
-        return
-    to_remove: List[Tuple[str, int]] = []
-    for key, state in tracker.items():
-        remaining = int(state.get('remaining', 0)) - 1
-        state['remaining'] = remaining
-        if remaining <= 0:
-            to_remove.append(key)
-    for key in to_remove:
-        tracker.pop(key, None)
-
-
-def _create_scheduler(optimizer: optim.Optimizer, cfg: TrainConfig):
-    return optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer,
-        mode='min',
-        factor=cfg.scheduler_factor,
-        patience=cfg.scheduler_patience,
-        min_lr=cfg.scheduler_min_lr,
-    )
+def _unfreeze_module(module: nn.Module) -> None:
+    for p in module.parameters():
+        p.requires_grad = True
 
 
 class TensorDictDataset(Dataset):
@@ -522,7 +437,14 @@ def save_checkpoint(path: str, model: nn.Module):
     torch.save(model.state_dict(), path)
 
 
-def save_training_curves(train_history: List[float], val_history: List[float], out_dir: str, suffix: str = '', best_epoch: int | None = None) -> None:
+def save_training_curves(
+    train_history: List[float],
+    val_history: List[float],
+    out_dir: str,
+    suffix: str = '',
+    best_epoch: int | None = None,
+    phase_boundaries: List[int] | None = None,
+) -> None:
     if not train_history or not val_history:
         return
     if plt is None:
@@ -536,9 +458,14 @@ def save_training_curves(train_history: List[float], val_history: List[float], o
     if best_epoch is not None and 1 <= best_epoch <= len(train_history):
         best_val = val_history[best_epoch - 1]
         ax.scatter([best_epoch], [best_val], color='red', s=40, zorder=5, label=f'Best ep {best_epoch}')
+    if phase_boundaries:
+        phase_labels = ['RGB→RGBD', 'RGBD→Joint']
+        for i, bnd in enumerate(phase_boundaries):
+            lbl = phase_labels[i] if i < len(phase_labels) else f'Phase {i+2}'
+            ax.axvline(bnd + 0.5, color='gray', linestyle=':', linewidth=1.5, alpha=0.7, label=lbl)
     ax.set_xlabel('Epoch')
     ax.set_ylabel('MAE')
-    ax.set_title('Training vs Validation MAE')
+    ax.set_title('Training vs Validation MAE (3-phase)')
     ax.grid(True, linestyle='--', linewidth=0.5, alpha=0.6)
     ax.legend(fontsize=8)
 
@@ -558,186 +485,239 @@ def train_fusion_regressor(
     fold_suffix: str = '',
     fold_label: str = '',
 ):
-    if cfg.huber_delta is not None and float(cfg.huber_delta) > 0.0:
-        criterion = nn.SmoothL1Loss(beta=float(cfg.huber_delta))
-    else:
-        criterion = nn.L1Loss()
-    optimizer = optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
-    scheduler = _create_scheduler(optimizer, cfg)
-    stopper = EarlyStopper(cfg.patience)
+    criterion = (
+        nn.SmoothL1Loss(beta=float(cfg.huber_delta)) if cfg.huber_delta and float(cfg.huber_delta) > 0.0
+        else nn.L1Loss()
+    )
 
     best_name = f'best_model_v8{fold_suffix}.pth' if fold_suffix else 'best_model_v8.pth'
     best_path = str(Path(cfg.out_dir) / best_name)
     train_history: List[float] = []
     val_history: List[float] = []
-    mae_window = max(1, int(cfg.best_mae_window))
+    best_epoch_index: int | None = None
+    best_val_mae: float = float('inf')
+    phase_boundaries: List[int] = []
+
     use_ema = cfg.ema_decay is not None and float(cfg.ema_decay) > 0.0
     ema_model = None
     if use_ema:
         ema_model = copy.deepcopy(model).to(device)
         for param in ema_model.parameters():
             param.requires_grad_(False)
-    best_saved = False
-    best_epoch_index: int | None = None
-    interrupted = False
-    rgb_blocks = list(model.rgb_branch.features)
-    rgbd_blocks = list(model.rgbd_branch.features)
-    blocks_map: Dict[str, Sequence[nn.Module]] = {'RGB': rgb_blocks, 'RGBD': rgbd_blocks}
-    block_warmups: Dict[Tuple[str, int], Dict[str, int]] = {}
-    frozen_rgb = min(cfg.initial_frozen_rgb_blocks, len(rgb_blocks))
-    frozen_rgbd = min(cfg.initial_frozen_rgbd_blocks, len(rgbd_blocks))
-    if frozen_rgb > 0:
-        apply_block_freezing(rgb_blocks, frozen_rgb)
-        print(f"[train] freezing first {frozen_rgb} RGB blocks")
-    if frozen_rgbd > 0:
-        apply_block_freezing(rgbd_blocks, frozen_rgbd)
-        print(f"[train] freezing first {frozen_rgbd} RGBD blocks")
 
-    rgb_interval = cfg.rgb_unfreeze_interval if cfg.rgb_unfreeze_interval > 0 else cfg.unfreeze_interval
-    rgbd_interval = cfg.rgbd_unfreeze_interval if cfg.rgbd_unfreeze_interval > 0 else cfg.unfreeze_interval
+    def _run_phase(
+        phase_name: str,
+        num_epochs: int,
+        max_lr: float,
+        loss_weights: Tuple[float, float, float],
+        eval_metric: str = 'fused',
+        branch_lr_scale: float = 1.0,
+        use_early_stop: bool = False,
+    ) -> None:
+        nonlocal best_val_mae, best_epoch_index
+        rgb_w, rgbd_w, fusion_w = loss_weights
 
-    def on_rgb_unfreeze(block_idx: int) -> None:
-        start_block_warmup(block_warmups, 'RGB', block_idx, cfg.branch_warmup_epochs)
+        # Build param groups with differential LR
+        branch_params = [p for n, p in model.named_parameters()
+                         if p.requires_grad and ('rgb_branch' in n or 'rgbd_branch' in n)]
+        fusion_params = [p for n, p in model.named_parameters()
+                         if p.requires_grad and 'rgb_branch' not in n and 'rgbd_branch' not in n]
+        branch_lr = max_lr * branch_lr_scale
+        param_groups = []
+        if branch_params:
+            param_groups.append({'params': branch_params, 'lr': branch_lr})
+        if fusion_params:
+            param_groups.append({'params': fusion_params, 'lr': max_lr})
+        if not param_groups:
+            print(f'  WARNING: no trainable params in {phase_name}!')
+            return
 
-    def on_rgbd_unfreeze(block_idx: int) -> None:
-        start_block_warmup(block_warmups, 'RGBD', block_idx, cfg.branch_warmup_epochs)
+        n_trainable = sum(p.numel() for pg in param_groups for p in pg['params'])
+        print(f"\n{'='*60}")
+        print(f"  Phase: {phase_name}")
+        print(f"  Epochs: {num_epochs}  |  trainable params: {n_trainable:,}")
+        if branch_lr_scale < 1.0:
+            print(f"  LR: branches={branch_lr:.1e}  fusion/head={max_lr:.1e}")
+        else:
+            print(f"  LR: {max_lr:.1e}")
+        print(f"  Loss weights: RGB={rgb_w:.1f}  RGBD={rgbd_w:.1f}  Fusion={fusion_w:.1f}")
+        print(f"{'='*60}")
 
-    try:
-        for epoch in range(cfg.num_epochs):
-            reset_scheduler = False
-            # Recompute freezing schedule before training so newly unfrozen blocks
-            # participate in the current epoch instead of waiting one more.
-            frozen_rgb, rgb_unfrozen_idx = maybe_unfreeze_blocks(
-                epoch,
-                cfg.unfreeze_start_epoch,
-                rgb_interval,
-                frozen_rgb,
-                rgb_blocks,
-                'RGB',
-                on_rgb_unfreeze,
-            )
-            if rgb_unfrozen_idx is not None:
-                reset_scheduler = True
-            frozen_rgbd, rgbd_unfrozen_idx = maybe_unfreeze_blocks(
-                epoch,
-                cfg.unfreeze_start_epoch,
-                rgbd_interval,
-                frozen_rgbd,
-                rgbd_blocks,
-                'RGBD',
-                on_rgbd_unfreeze,
-            )
-            if rgbd_unfrozen_idx is not None:
-                reset_scheduler = True
-            if reset_scheduler:
-                for group in optimizer.param_groups:
-                    group['lr'] = cfg.lr
-                scheduler = _create_scheduler(optimizer, cfg)
-                print('[train] scheduler reset to base LR due to block unfreeze')
-            model.train()
-            train_mae_sum, n_train = 0.0, 0
-            train_sup_loss_sum = 0.0
+        optimizer = optim.AdamW(param_groups, weight_decay=cfg.weight_decay)
+        max_lrs = [pg['lr'] for pg in param_groups]
+        total_steps = len(train_loader) * num_epochs
+        scheduler = optim.lr_scheduler.OneCycleLR(
+            optimizer,
+            max_lr=max_lrs,
+            total_steps=total_steps,
+            pct_start=cfg.onecycle_pct_start,
+            div_factor=cfg.onecycle_div_factor,
+            final_div_factor=cfg.onecycle_final_div_factor,
+            anneal_strategy='cos',
+        )
+        stopper = EarlyStopper(cfg.patience) if use_early_stop else None
+        global_offset = len(train_history)
 
-            for batch in train_loader:
-                rgb = batch['rgb'].to(device, non_blocking=True)
-                rgbd = batch['rgbd'].to(device, non_blocking=True)
-                y = batch['dry_weight'].to(device, non_blocking=True)
+        try:
+            for ep in range(num_epochs):
+                global_ep = global_offset + ep + 1
 
-                rgb, rgbd, y = maybe_mixup_batch(rgb, rgbd, y, cfg.mixup_alpha, cfg.mixup_prob)
-                rgb, rgbd, y = maybe_cutmix_batch(rgb, rgbd, y, cfg.cutmix_alpha, cfg.cutmix_prob)
+                # ---- train ------------------------------------------------
+                model.train()
+                t_mae_sum, n_t = 0.0, 0
 
-                optimizer.zero_grad(set_to_none=True)
-                rgb_pred, rgbd_pred, fusion_pred = model(rgb, rgbd)
-                loss_rgb = criterion(rgb_pred, y)
-                loss_rgbd = criterion(rgbd_pred, y)
-                loss_fusion = criterion(fusion_pred, y)
-                fusion_mae = torch.mean(torch.abs(fusion_pred - y))
-                loss = (
-                    RGB_LOSS_WEIGHT * loss_rgb
-                    + RGBD_LOSS_WEIGHT * loss_rgbd
-                    + FUSION_LOSS_WEIGHT * loss_fusion
-                )
-                loss.backward()
-                apply_block_warmup_scaling(
-                    block_warmups,
-                    blocks_map,
-                    cfg.branch_warmup_scale,
-                )
-                optimizer.step()
-                if use_ema and ema_model is not None:
-                    update_ema_model(ema_model, model, cfg.ema_decay)
-
-                bs = y.size(0)
-                train_sup_loss_sum += loss.item() * bs
-                train_mae_sum += fusion_mae.item() * bs
-                n_train += bs
-
-            model.eval()
-            val_mae_sum, n_val = 0.0, 0
-            val_sup_loss_sum = 0.0
-            with torch.no_grad():
-                for batch in val_loader:
+                for batch in train_loader:
                     rgb = batch['rgb'].to(device, non_blocking=True)
                     rgbd = batch['rgbd'].to(device, non_blocking=True)
                     y = batch['dry_weight'].to(device, non_blocking=True)
 
-                    rgb_pred, rgbd_pred, fusion_pred = model(rgb, rgbd)
-                    loss_rgb = criterion(rgb_pred, y)
-                    loss_rgbd = criterion(rgbd_pred, y)
-                    loss_fusion = criterion(fusion_pred, y)
-                    fusion_mae = torch.mean(torch.abs(fusion_pred - y))
-                    val_loss = (
-                        RGB_LOSS_WEIGHT * loss_rgb
-                        + RGBD_LOSS_WEIGHT * loss_rgbd
-                        + FUSION_LOSS_WEIGHT * loss_fusion
-                    )
+                    rgb, rgbd, y = maybe_mixup_batch(rgb, rgbd, y, cfg.mixup_alpha, cfg.mixup_prob)
+                    rgb, rgbd, y = maybe_cutmix_batch(rgb, rgbd, y, cfg.cutmix_alpha, cfg.cutmix_prob)
+
+                    optimizer.zero_grad(set_to_none=True)
+                    rp, dp, fp = model(rgb, rgbd)
+                    loss = 0.0
+                    if rgb_w > 0:
+                        loss = loss + rgb_w * criterion(rp, y)
+                    if rgbd_w > 0:
+                        loss = loss + rgbd_w * criterion(dp, y)
+                    if fusion_w > 0:
+                        loss = loss + fusion_w * criterion(fp, y)
+                    loss.backward()
+                    optimizer.step()
+                    scheduler.step()
+
+                    if use_ema and ema_model is not None:
+                        update_ema_model(ema_model, model, cfg.ema_decay)
+
                     bs = y.size(0)
-                    val_sup_loss_sum += val_loss.item() * bs
-                    val_mae_sum += fusion_mae.item() * bs
-                    n_val += bs
+                    if eval_metric == 'rgb':
+                        t_mae_sum += torch.mean(torch.abs(rp.detach() - y)).item() * bs
+                    elif eval_metric == 'rgbd':
+                        t_mae_sum += torch.mean(torch.abs(dp.detach() - y)).item() * bs
+                    else:
+                        t_mae_sum += torch.mean(torch.abs(fp.detach() - y)).item() * bs
+                    n_t += bs
 
-            train_mae = train_mae_sum / max(1, n_train)
-            val_mae = val_mae_sum / max(1, n_val)
-            train_sup_loss = train_sup_loss_sum / max(1, n_train)
-            val_sup_loss = val_sup_loss_sum / max(1, n_val)
-            train_history.append(train_mae)
-            val_history.append(val_mae)
-            smooth_span = min(mae_window, len(val_history))
-            smooth_val_mae = float(np.mean(val_history[-smooth_span:]))
-            current_lr = optimizer.param_groups[0]['lr']
-            prefix = f"[train][{fold_label}]" if fold_label else '[train]'
-            print(
-                f"{prefix} epoch {epoch+1}/{cfg.num_epochs} lr={current_lr:.3e} "
-                f"train_mae={train_mae:.4f} val_mae={val_mae:.4f} "
-                f"smoothed_val_mae({smooth_span})={smooth_val_mae:.4f} "
-                f"train_loss={train_sup_loss:.4f} val_loss={val_sup_loss:.4f}"
-            )
+                # ---- validate ----------------------------------------------
+                model.eval()
+                v_mae_sum, n_v = 0.0, 0
+                with torch.no_grad():
+                    for batch in val_loader:
+                        rgb_b = batch['rgb'].to(device, non_blocking=True)
+                        rgbd_b = batch['rgbd'].to(device, non_blocking=True)
+                        y_b = batch['dry_weight'].to(device, non_blocking=True)
+                        rp, dp, fp = model(rgb_b, rgbd_b)
+                        bs = y_b.size(0)
+                        if eval_metric == 'rgb':
+                            v_mae_sum += torch.mean(torch.abs(rp - y_b)).item() * bs
+                        elif eval_metric == 'rgbd':
+                            v_mae_sum += torch.mean(torch.abs(dp - y_b)).item() * bs
+                        else:
+                            v_mae_sum += torch.mean(torch.abs(fp - y_b)).item() * bs
+                        n_v += bs
 
-            if smooth_val_mae <= stopper.best:
-                target = ema_model if use_ema and ema_model is not None else model
-                save_checkpoint(best_path, target)
-                best_saved = True
-                best_epoch_index = epoch + 1
-            if stopper.step(smooth_val_mae):
-                print(f"[train] early stop at epoch {epoch+1} (best val_mae={stopper.best:.4f})")
-                break
+                t_mae = t_mae_sum / max(1, n_t)
+                v_mae = v_mae_sum / max(1, n_v)
+                train_history.append(t_mae)
+                val_history.append(v_mae)
+                span = min(cfg.best_mae_window, len(val_history))
+                smooth = float(np.mean(val_history[-span:]))
+                lr_now = optimizer.param_groups[0]['lr']
+                tag = f'[{fold_label}] ' if fold_label else ''
+                print(
+                    f"  {tag}{phase_name} ep {ep+1:>3}/{num_epochs} (global {global_ep})  "
+                    f"lr={lr_now:.2e}  train={t_mae:.4f}  val={v_mae:.4f}  "
+                    f"smooth({span})={smooth:.4f}"
+                )
 
-            scheduler.step(val_mae)
-            decay_block_warmups(block_warmups)
-    except KeyboardInterrupt:
-        interrupted = True
-        print('\n[train] KeyboardInterrupt received; saving current progress...')
+                if v_mae < best_val_mae:
+                    best_val_mae = v_mae
+                    target = ema_model if use_ema and ema_model is not None else model
+                    save_checkpoint(best_path, target)
+                    best_epoch_index = global_ep
+                    print(f"    ★ saved best model (val_mae={v_mae:.4f})")
+
+                if stopper is not None and stopper.step(smooth):
+                    print(f"  early stop at ep {ep+1} (best_val={best_val_mae:.4f})")
+                    break
+
+                if (ep + 1) % 5 == 0 or (ep + 1) == num_epochs:
+                    save_training_curves(train_history, val_history, cfg.out_dir,
+                                         suffix=fold_suffix, best_epoch=best_epoch_index,
+                                         phase_boundaries=phase_boundaries)
+        except KeyboardInterrupt:
+            last_path = best_path.replace('best_model', 'last_model')
+            target = ema_model if use_ema and ema_model is not None else model
+            save_checkpoint(last_path, target)
+            print(f"\n  interrupted during {phase_name} — saved current → {last_path}")
+            print(f"  (best checkpoint untouched at {best_path}, val_mae={best_val_mae:.4f})")
+
+    # ==================================================================
+    # Phase 1 — RGB branch only
+    # ==================================================================
+    _freeze_module(model.rgbd_branch)
+    _freeze_module(model.fusion)
+    _freeze_module(model.fusion_in_dropout)
+    # Also freeze shared spatial attention for RGBD if not shared
+    _unfreeze_module(model.rgb_branch)
+
+    _run_phase(
+        phase_name='Phase 1: RGB branch',
+        num_epochs=cfg.phase1_epochs,
+        max_lr=cfg.phase1_lr,
+        loss_weights=(1.0, 0.0, 0.0),
+        eval_metric='rgb',
+    )
+    phase_boundaries.append(len(train_history))
+
+    # ==================================================================
+    # Phase 2 — RGBD branch only
+    # ==================================================================
+    _freeze_module(model.rgb_branch)
+    _freeze_module(model.fusion)
+    _unfreeze_module(model.rgbd_branch)
+
+    _run_phase(
+        phase_name='Phase 2: RGBD branch',
+        num_epochs=cfg.phase2_epochs,
+        max_lr=cfg.phase2_lr,
+        loss_weights=(0.0, 1.0, 0.0),
+        eval_metric='rgbd',
+    )
+    phase_boundaries.append(len(train_history))
+
+    # ==================================================================
+    # Phase 3 — Joint fine-tuning (everything)
+    # ==================================================================
+    best_val_mae = float('inf')  # reset for phase 3
+    best_epoch_index = None
+
+    _unfreeze_module(model.rgb_branch)
+    _unfreeze_module(model.rgbd_branch)
+    _unfreeze_module(model.fusion)
+    _unfreeze_module(model.fusion_in_dropout)
+
+    _run_phase(
+        phase_name='Phase 3: Joint fine-tune',
+        num_epochs=cfg.phase3_epochs,
+        max_lr=cfg.phase3_lr,
+        loss_weights=(RGB_LOSS_WEIGHT, RGBD_LOSS_WEIGHT, FUSION_LOSS_WEIGHT),
+        eval_metric='fused',
+        branch_lr_scale=cfg.phase3_branch_lr_scale,
+        use_early_stop=True,
+    )
+
+    # Ensure checkpoint exists
+    if not os.path.exists(best_path):
         target = ema_model if use_ema and ema_model is not None else model
         save_checkpoint(best_path, target)
-        best_saved = True
 
-    target = ema_model if use_ema and ema_model is not None else model
-    if not best_saved or not os.path.exists(best_path):
-        save_checkpoint(best_path, target)
-        best_saved = True
-    if interrupted:
-        print(f"[train] interrupted — best checkpoint saved to {best_path}")
-    return best_path, train_history, val_history, stopper.best, best_epoch_index
+    save_training_curves(train_history, val_history, cfg.out_dir,
+                         suffix=fold_suffix, best_epoch=best_epoch_index,
+                         phase_boundaries=phase_boundaries)
+
+    return best_path, train_history, val_history, best_val_mae, best_epoch_index
 
 
 def main():
@@ -746,6 +726,9 @@ def main():
 
     seed_everything(cfg.seed, deterministic=True)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    total_epochs = cfg.phase1_epochs + cfg.phase2_epochs + cfg.phase3_epochs
+    print(f'[train] device={device}  3-phase: {cfg.phase1_epochs} (RGB) + '
+          f'{cfg.phase2_epochs} (RGBD) + {cfg.phase3_epochs} (joint) = {total_epochs} total')
 
     fold_loaders = make_fold_loaders(cfg)
     total_folds = len(fold_loaders)
