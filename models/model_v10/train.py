@@ -91,7 +91,7 @@ class TrainConfig:
     mixup_prob: float = 0.0
     huber_delta: float = 2.0
     ema_decay: float = 0.995
-    standardize_targets: bool = True  # z-score targets → mean=0, std=1
+    standardize_targets: bool = False  # z-score targets → mean=0, std=1
 
     # ---- phased branch-wise pretraining -----------------------------------
     # Phase 1: train RGB branch alone (RGBD + fusion frozen)
