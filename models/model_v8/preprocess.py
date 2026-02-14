@@ -31,7 +31,7 @@ class PreprocessConfig:
 
     # how many augmented variants per original (not counting the original)
     num_aug_per_image: int = 45
-    max_center_shift: int = 50 # max pixel shift for random pre-crop translations
+    max_center_shift: int = 0 # max pixel shift for random pre-crop translations
     seed: int = 42
     depth_noise_std: float = 0.03  # Gaussian noise std (0-1 range) applied to depth channel
     depth_noise_prob: float = 0.7  # Probability of applying depth noise to a sample
