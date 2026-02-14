@@ -82,13 +82,13 @@ class TrainConfig:
 
     # ---- architecture -----------------------------------------------------
     drop_path_prob: float = 0.05
-    rgb_widths: Tuple[int, ...] = (16, 32, 64, 96)
-    rgbd_widths: Tuple[int, ...] = (16, 32, 64, 128)
+    rgb_widths: Tuple[int, ...] = (16, 32, 64, 128)
+    rgbd_widths: Tuple[int, ...] = (16, 32, 64, 144)
     embed_dim: int = 96
 
     # ---- regularisation ---------------------------------------------------
     mixup_alpha: float = 0.1
-    mixup_prob: float = 0.4
+    mixup_prob: float = 0.0
     huber_delta: float = 0.3
     ema_decay: float = 0.995
 
@@ -113,7 +113,7 @@ class TrainConfig:
     # ---- output -----------------------------------------------------------
     out_dir: str = "."
     blacklist_ids: Tuple[int, ...] = (163,)
-    best_mae_window: int = 5
+    best_mae_window: int = 1
 
 
 # ---------------------------------------------------------------------------
