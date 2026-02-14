@@ -49,7 +49,7 @@ class BottleneckBlock(nn.Module):
     """1×1 → 3×3 → 1×1 bottleneck with residual connection + 2× pooling."""
 
     def __init__(
-        self, in_ch: int, out_ch: int, *, reduction: int = 4, drop_prob: float = 0.0
+        self, in_ch: int, out_ch: int, *, reduction: int = 2, drop_prob: float = 0.0
     ) -> None:
         super().__init__()
         mid = max(1, out_ch // max(1, reduction))
@@ -240,13 +240,13 @@ class LettuceSAMFusionNet(nn.Module):
     def __init__(
         self,
         *,
-        drop_path_prob: float = 0.1,
+        drop_path_prob: float = 0.05,
         rgb_widths: Tuple[int, ...] = (32, 64, 96, 128),
         rgbd_widths: Tuple[int, ...] = (32, 64, 96, 128),
         embed_dim: int = 256,
-        branch_dropout: float = 0.3,
+        branch_dropout: float = 0.15,
         fusion_hidden: int | None = None,
-        fusion_dropout: float = 0.4,
+        fusion_dropout: float = 0.25,
     ) -> None:
         super().__init__()
         self.rgb_branch = RegressionBranch(
@@ -269,7 +269,7 @@ class LettuceSAMFusionNet(nn.Module):
             hidden=fusion_hidden,
             dropout=fusion_dropout,
         )
-        self.fusion_in_dropout = nn.Dropout(p=0.3)
+        self.fusion_in_dropout = nn.Dropout(p=0.15)
 
     # ---- forward / inference -------------------------------------------
 

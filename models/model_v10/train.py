@@ -64,7 +64,7 @@ class TrainConfig:
 
     # ---- training ---------------------------------------------------------
     batch_size: int = 128
-    weight_decay: float = 1e-3
+    weight_decay: float = 5e-4
 
     # OneCycleLR schedule (used inside each phase)
     onecycle_pct_start: float = 0.3        # fraction of phase spent warming up
@@ -81,14 +81,14 @@ class TrainConfig:
     group_by_original: bool = True
 
     # ---- architecture -----------------------------------------------------
-    drop_path_prob: float = 0.15
+    drop_path_prob: float = 0.05
     rgb_widths: Tuple[int, ...] = (16, 32, 64, 96)
     rgbd_widths: Tuple[int, ...] = (16, 32, 64, 128)
     embed_dim: int = 96
 
     # ---- regularisation ---------------------------------------------------
-    mixup_alpha: float = 0.2
-    mixup_prob: float = 0.5
+    mixup_alpha: float = 0.1
+    mixup_prob: float = 0.4
     huber_delta: float = 0.3
     ema_decay: float = 0.995
 
@@ -96,11 +96,11 @@ class TrainConfig:
     # Phase 1: train RGB branch alone (RGBD + fusion frozen)
     # Phase 2: train RGBD branch alone (RGB + fusion frozen)
     # Phase 3: fine-tune everything together (branches + fusion)
-    phase1_epochs: int = 60      # RGB branch pretraining
-    phase2_epochs: int = 60      # RGBD branch pretraining
-    phase3_epochs: int = 80      # joint fine-tuning
-    phase1_lr: float = 2e-3      # higher LR for branch pretraining
-    phase2_lr: float = 2e-3
+    phase1_epochs: int = 25      # RGB branch pretraining  (converges by ~12, stop before memorising)
+    phase2_epochs: int = 25      # RGBD branch pretraining
+    phase3_epochs: int = 120     # joint fine-tuning — this is where real gains happen
+    phase1_lr: float = 1e-3      # calmer LR for branch pretraining
+    phase2_lr: float = 1e-3
     phase3_lr: float = 5e-4      # lower LR for fine-tuning
     phase3_branch_lr_scale: float = 0.2  # branches get lr * this in phase 3
 
@@ -108,7 +108,7 @@ class TrainConfig:
     use_amp: bool = True
     use_compile: bool = False  # requires Triton (Linux only); leave False on Windows
     grad_accum_steps: int = 1
-    preload_to_gpu: bool = True  # move entire dataset to CUDA once (eliminates CPU→GPU transfers)
+    preload_to_gpu: bool = False  # move entire dataset to CUDA once (eliminates CPU→GPU transfers)
 
     # ---- output -----------------------------------------------------------
     out_dir: str = "."
